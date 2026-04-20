@@ -29,7 +29,7 @@ MIN_LIQUIDITY = 500.0
 MIN_VOLUME = 1000.0
 
 # Safe exit settings
-SAFE_EXIT_HOURS = 6.0
+SAFE_EXIT_MINUTES = 4
 MAX_DROP_PERCENT = 0.90
 
 PORTFOLIO_FILE = "portfolio.json"
@@ -42,6 +42,7 @@ TELEGRAM_POLL_TIMEOUT_SECONDS = 20
 TELEGRAM_POLL_RETRY_SECONDS = 3
 TELEGRAM_REQUEST_TIMEOUT_SECONDS = 20
 TELEGRAM_MENU_BUTTON_STATS = "📊 Статистика"
+TELEGRAM_MENU_BUTTON_ACTIVE_BETS = "📂 Активные сделки"
 
 session = requests.Session()
 session.headers.update(
@@ -171,6 +172,44 @@ def build_status_message():
     return "\n".join(lines)
 
 
+def build_active_bets_message():
+    portfolio = load_portfolio()
+    active_bets = portfolio.get("active_bets", [])
+
+    lines = [
+        "📂 Active Bets",
+        f"🕒 {datetime.now().strftime('%H:%M:%S')}",
+        "",
+    ]
+
+    if not active_bets:
+        lines.append("No active bets.")
+        return "\n".join(lines)
+
+    for index, bet in enumerate(active_bets, start=1):
+        question = bet.get("question", "Unknown market").replace("\n", " ").strip()
+        outcome = bet.get("outcome", "Unknown outcome")
+        buy_price = float(bet.get("buy_price", 0.0))
+        current_price = float(bet.get("current_price", buy_price))
+        shares = float(bet.get("shares", 0.0))
+        current_value = float(bet.get("current_value", bet.get("cost", 0.0)))
+        status = bet.get("status", "ACTIVE")
+
+        lines.append(f"{index}. {question[:100]}")
+        lines.append(
+            (
+                f"   Outcome: {outcome} | Buy: ${buy_price:.4f} | "
+                f"Now: ${current_price:.4f}"
+            )
+        )
+        lines.append(
+            f"   Shares: {shares:.2f} | Value: ${current_value:.2f} | Status: {status}"
+        )
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
+
+
 class TelegramBridge:
     def __init__(self, token, admin_ids):
         self.token = token.strip()
@@ -279,6 +318,9 @@ class TelegramBridge:
                 [
                     {
                         "text": TELEGRAM_MENU_BUTTON_STATS,
+                    },
+                    {
+                        "text": TELEGRAM_MENU_BUTTON_ACTIVE_BETS,
                     }
                 ]
             ],
@@ -307,10 +349,30 @@ class TelegramBridge:
                 build_status_message(),
                 disable_notification=True,
             )
+        elif text in {
+            "/active",
+            "/positions",
+            "active",
+            "positions",
+            TELEGRAM_MENU_BUTTON_ACTIVE_BETS.lower(),
+        }:
+            self.send_message(
+                chat_id,
+                build_active_bets_message(),
+                disable_notification=True,
+            )
         elif text in {"/help", "help"}:
             self.send_message(
                 chat_id,
-                f"Available commands:\n/menu\n/status\n/help\n\nButton: {TELEGRAM_MENU_BUTTON_STATS}",
+                (
+                    "Available commands:\n"
+                    "/menu\n"
+                    "/status\n"
+                    "/active\n"
+                    "/help\n\n"
+                    f"Buttons: {TELEGRAM_MENU_BUTTON_STATS}, "
+                    f"{TELEGRAM_MENU_BUTTON_ACTIVE_BETS}"
+                ),
                 disable_notification=True,
             )
 
@@ -503,15 +565,15 @@ def check_portfolio(portfolio):
                             continue
 
                         if event_end_date:
-                            hours_left = (event_end_date - now).total_seconds() / 3600.0
-                            if 0 < hours_left <= SAFE_EXIT_HOURS:
+                            minutes_left = (event_end_date - now).total_seconds() / 60.0
+                            if 0 < minutes_left <= SAFE_EXIT_MINUTES:
                                 drop_ratio = current_price / bet["buy_price"]
                                 if drop_ratio >= (1.0 - MAX_DROP_PERCENT):
                                     payout = bet["shares"] * current_price
                                     portfolio["balance"] += payout
                                     log(
                                         (
-                                            f"✅ SAFE EXIT {hours_left:.1f}h left, "
+                                            f"✅ SAFE EXIT {minutes_left:.1f}m left, "
                                             f"refund +${payout:.2f} | {market['question'][:80]}\n"
                                             f"Balance: {get_balance_snapshot(portfolio)}"
                                         ),
@@ -556,7 +618,7 @@ def fetch_and_scan_all(portfolio):
 
     now = datetime.now(timezone.utc)
     max_end_date = now + timedelta(days=MAX_DAYS_TO_EXPIRY)
-    min_end_date = now + timedelta(hours=SAFE_EXIT_HOURS)
+    min_end_date = now + timedelta(minutes=SAFE_EXIT_MINUTES)
 
     existing_market_ids = [bet["market_id"] for bet in portfolio["active_bets"]] + [
         bet["market_id"] for bet in portfolio["history"]
