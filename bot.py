@@ -60,17 +60,18 @@ def log(msg):
     print(f"[{time_str}] {msg}")
 
 def print_stats(portfolio):
-    locked = sum(bet['cost'] for bet in portfolio['active_bets'])
+    # Теперь Локед баланс считается по актуальной рыночной стоимости!
+    locked = sum(bet.get('current_value', bet['cost']) for bet in portfolio['active_bets'])
     free = portfolio['balance']
     total = free + locked
-    log(f"💰 Баланс: Свободно ${free:.2f} | В ордерах (Locked): ${locked:.2f} | Всего активов: ${total:.2f}")
+    log(f"💰 Баланс: Свободно ${free:.2f} | В ордерах (Market Value): ${locked:.2f} | Всего активов: ${total:.2f}")
     log(f"📊 Открытых позиций: {len(portfolio['active_bets'])}")
 
 def check_portfolio(portfolio):
     if not portfolio["active_bets"]:
         return
 
-    log("Проверяем позиции (Тейк-профит / Сейф-Экзит)...")
+    log("Проверяем позиции и обновляем цены...")
     active_bets = portfolio["active_bets"]
     still_active = []
     now = datetime.now(timezone.utc)
@@ -83,13 +84,16 @@ def check_portfolio(portfolio):
                 market = next((m for m in event.get("markets", []) if m["id"] == bet["market_id"]), None)
                 
                 if market:
-                    # 1. Проверка на закрытие
+                    # 1. Проверка на официальное закрытие (Resolution)
                     if market.get("closed"):
                         tokens_resolved = market.get("tokensResolved", [])
                         if not tokens_resolved:
+                            # Маркет закрыт, но выплаты еще не распределены
+                            bet['status'] = 'W8_TO_RESOLVE'
                             still_active.append(bet)
                             continue
 
+                        # Если мы угадали:
                         if str(tokens_resolved[bet['outcome_index']]) == "1":
                             payout = bet['shares'] * 1.0 
                             portfolio["balance"] += payout
@@ -97,17 +101,36 @@ def check_portfolio(portfolio):
                             bet['status'] = 'WON'
                             bet['payout'] = payout
                         else:
+                            log(f"❌ ЛОСС: Исход не сыграл | {market['question'][:40]}")
                             bet['status'] = 'LOST'
                             bet['payout'] = 0
+                            
+                        bet['close_date'] = datetime.now().isoformat()
                         portfolio["history"].append(bet)
                         continue 
 
-                    # Получаем текущую цену
+                    # Получаем текущую цену для обновления баланса
                     prices = json.loads(market.get("outcomePrices", "[]"))
                     if len(prices) > bet['outcome_index']:
                         current_price = float(prices[bet['outcome_index']])
+                        bet['current_price'] = current_price
+                        bet['current_value'] = current_price * bet['shares'] # Обновляем реальную стоимость позы
                         
-                        # 2. Проверка ТЕЙК-ПРОФИТА
+                        # Парсим дату конца
+                        event_end_date = None
+                        end_date_str = event.get("endDate")
+                        if end_date_str:
+                            clean_date_str = end_date_str.replace('Z', '+00:00')
+                            event_end_date = datetime.fromisoformat(clean_date_str)
+
+                        # 2. Если дата уже прошла, но не closed - ждем резолюции, НЕ продаем
+                        if event_end_date and now >= event_end_date:
+                            log(f"⏳ ОЖИДАНИЕ РЕЗОЛЮЦИИ (Экспирация прошла) | {market['question'][:40]}")
+                            bet['status'] = 'W8_TO_RESOLVE'
+                            still_active.append(bet)
+                            continue
+
+                        # 3. Проверка ТЕЙК-ПРОФИТА
                         target_price = bet['buy_price'] * TAKE_PROFIT_MULTIPLIER
                         if current_price >= target_price:
                             payout = bet['shares'] * current_price
@@ -116,32 +139,26 @@ def check_portfolio(portfolio):
                             bet['status'] = 'SOLD_PROFIT'
                             bet['sell_price'] = current_price
                             bet['payout'] = payout
+                            bet['close_date'] = datetime.now().isoformat()
                             portfolio["history"].append(bet)
                             continue 
                             
-                        # 3. Проверка СЕЙФ-ЭКЗИТА (Безопасный выход перед концом)
-                        end_date_str = event.get("endDate")
-                        if end_date_str:
-                            try:
-                                clean_date_str = end_date_str.replace('Z', '+00:00')
-                                event_end_date = datetime.fromisoformat(clean_date_str)
-                                hours_left = (event_end_date - now).total_seconds() / 3600.0
-                                
-                                # Если осталось меньше SAFE_EXIT_HOURS часов
-                                if 0 < hours_left <= SAFE_EXIT_HOURS:
-                                    drop_ratio = current_price / bet['buy_price']
-                                    
-                                    # Выходим только если сохранили хотя бы >10% стоимости (упали не более чем на 90%)
-                                    if drop_ratio >= (1.0 - MAX_DROP_PERCENT):
-                                        payout = bet['shares'] * current_price
-                                        portfolio["balance"] += payout
-                                        log(f"🛡️ СЕЙФ-ЭКЗИТ! До конца {hours_left:.1f}ч. Кэшбек: +${payout:.2f} | {market['question'][:30]}")
-                                        bet['status'] = 'SOLD_SAFE'
-                                        bet['sell_price'] = current_price
-                                        bet['payout'] = payout
-                                        portfolio["history"].append(bet)
-                                        continue
-                            except: pass
+                        # 4. Проверка СЕЙФ-ЭКЗИТА (Безопасный выход перед концом)
+                        if event_end_date:
+                            hours_left = (event_end_date - now).total_seconds() / 3600.0
+                            if 0 < hours_left <= SAFE_EXIT_HOURS:
+                                drop_ratio = current_price / bet['buy_price']
+                                # Выходим только если сохранили хотя бы >10% стоимости
+                                if drop_ratio >= (1.0 - MAX_DROP_PERCENT):
+                                    payout = bet['shares'] * current_price
+                                    portfolio["balance"] += payout
+                                    log(f"🛡️ СЕЙФ-ЭКЗИТ! До конца {hours_left:.1f}ч. Кэшбек: +${payout:.2f} (куплено за {bet['buy_price']}, сейчас {current_price}) | {market['question'][:30]}")
+                                    bet['status'] = 'SOLD_SAFE'
+                                    bet['sell_price'] = current_price
+                                    bet['payout'] = payout
+                                    bet['close_date'] = datetime.now().isoformat()
+                                    portfolio["history"].append(bet)
+                                    continue
 
             still_active.append(bet)
             time.sleep(0.2) 
@@ -153,11 +170,10 @@ def check_portfolio(portfolio):
     save_portfolio(portfolio)
 
 def get_market_score(market):
-    """Оценка 'жирности' рынка. Ликвидность важнее исторического объема."""
     try:
         vol = float(market.get("volume", 0))
         liq = float(market.get("liquidity", 0))
-        return vol + (liq * 2) # Ликвидности даем вес х2
+        return vol + (liq * 2) 
     except:
         return 0
 
@@ -170,11 +186,12 @@ def fetch_and_scan_all(portfolio):
     
     now = datetime.now(timezone.utc)
     max_end_date = now + timedelta(days=MAX_DAYS_TO_EXPIRY)
+    min_end_date = now + timedelta(hours=SAFE_EXIT_HOURS) # !!! ВАЖНО: Не берем события, которые скоро закончатся
     
     existing_market_ids = [b["market_id"] for b in portfolio["active_bets"]] + \
                           [b["market_id"] for b in portfolio["history"]]
 
-    candidates = [] # Список для будущих покупок
+    candidates = [] 
 
     while True:
         params = {"closed": "false", "limit": limit, "offset": offset}
@@ -193,7 +210,8 @@ def fetch_and_scan_all(portfolio):
                 if end_date_str:
                     try:
                         clean_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
-                        if clean_date < now or clean_date > max_end_date: continue 
+                        # Игнорируем то, что скоро закончится, чтобы избежать мгновенного Сейф-Экзита
+                        if clean_date <= min_end_date or clean_date > max_end_date: continue 
                     except: pass
                 else: continue
 
@@ -215,7 +233,6 @@ def fetch_and_scan_all(portfolio):
                         except: continue
 
                         if MIN_PRICE <= price <= MAX_PRICE:
-                            # Добавляем в список КАНДИДАТОВ, а не покупаем сразу
                             candidates.append({
                                 "score": get_market_score(market),
                                 "event": event,
@@ -246,15 +263,13 @@ def fetch_and_scan_all(portfolio):
     print("\nРадар завершен. Запускаем умную закупку...")
     save_watchlist(watchlist)
 
-    # --- УМНАЯ СОРТИРОВКА И ПОКУПКА ---
     if candidates:
-        # Сортируем кандидатов по 'жирности' (score) по убыванию
         candidates.sort(key=lambda x: x["score"], reverse=True)
         
         bought_count = 0
         for cand in candidates:
             if portfolio["balance"] < BET_AMOUNT:
-                break # Деньги кончились
+                break 
                 
             price = cand["price"]
             market = cand["market"]
@@ -271,6 +286,7 @@ def fetch_and_scan_all(portfolio):
                 "buy_price": price,
                 "shares": shares,
                 "cost": BET_AMOUNT,
+                "current_value": BET_AMOUNT, # На старте Value = Cost
                 "date": datetime.now().isoformat()
             })
             bought_count += 1
@@ -284,11 +300,13 @@ def fetch_and_scan_all(portfolio):
 def run_bot():
     log("-" * 50)
     portfolio = load_portfolio()
-    print_stats(portfolio)
     
+    # Сначала проверяем портфель (оно же обновит цены и закроет сделки)
     check_portfolio(portfolio) 
     
-    # Запускаем радар только если накопилось достаточно денег для пула ($5)
+    # Теперь печатаем стату с УЖЕ актуальным балансом
+    print_stats(portfolio)
+    
     if portfolio["balance"] >= SCANNER_THRESHOLD:
         fetch_and_scan_all(portfolio) 
     else:
@@ -303,7 +321,7 @@ def main():
     | _ \/ _ \  _|  _   | _ \/ _ \|  _|
     |___/\___/\__| (_)  |___/\___/ \__|
     """)
-    log("Запуск БОБА (v1.8: Умный Ранкинг + Сейф-Экзит). Ctrl+C для выхода.")
+    log("Запуск БОБА (v1.9: Фикс Балансов, Экспираций и Аналитики). Ctrl+C для выхода.")
     
     try:
         while True:
