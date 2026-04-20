@@ -2,9 +2,7 @@ import json
 import os
 import time
 from datetime import datetime
-
 import requests
-
 
 PORTFOLIO_FILE = "portfolio.json"
 SUBSCRIBERS_FILE = "telegram_chats.json"
@@ -14,10 +12,8 @@ POLL_INTERVAL_SECONDS = int(os.getenv("TELEGRAM_POLL_INTERVAL_SECONDS", "5"))
 STATUS_INTERVAL_SECONDS = int(os.getenv("TELEGRAM_STATUS_INTERVAL_SECONDS", "300"))
 REQUEST_TIMEOUT_SECONDS = 20
 
-
 def log(message):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
-
 
 def load_json(path, default):
     if os.path.exists(path):
@@ -25,56 +21,69 @@ def load_json(path, default):
             return json.load(file)
     return default
 
-
 def save_json(path, data):
     with open(path, "w", encoding="utf-8") as file:
         json.dump(data, file, indent=4, ensure_ascii=False)
 
-
 def load_portfolio():
     return load_json(PORTFOLIO_FILE, {"balance": 0.0, "active_bets": [], "history": []})
-
 
 def load_subscribers():
     return load_json(SUBSCRIBERS_FILE, {"offset": 0, "chats": {}})
 
-
 def save_subscribers(data):
     save_json(SUBSCRIBERS_FILE, data)
 
-
-def build_status_message():
+def build_core_status():
+    """Собирает основную статистику (без времени), чтобы проверять изменения"""
     portfolio = load_portfolio()
     balance = float(portfolio.get("balance", 0.0))
     active_bets = portfolio.get("active_bets", [])
     history = portfolio.get("history", [])
 
-    locked = sum(float(bet.get("cost", 0.0)) for bet in active_bets)
+    # Считаем Локед по НОВЫМ правилам (current_value)
+    locked = sum(float(bet.get("current_value", bet.get("cost", 1.0))) for bet in active_bets)
     total = balance + locked
-    won_count = sum(1 for bet in history if bet.get("status") == "WON")
-    lost_count = sum(1 for bet in history if bet.get("status") == "LOST")
-    sold_count = sum(1 for bet in history if bet.get("status") == "SOLD_EARLY")
+    net_profit = total - 100.0 # Старт с 100$
+
+    won_count = 0
+    lost_count = 0
+    tp_count = 0
+    safe_count = 0
+
+    for bet in history:
+        st = bet.get("status", "")
+        if st == "WON": won_count += 1
+        elif st == "LOST": lost_count += 1
+        elif st in ("SOLD_PROFIT", "SOLD_EARLY"): tp_count += 1
+        elif st == "SOLD_SAFE": safe_count += 1
+
+    total_closed = len(history)
+    win_rate = ((won_count + tp_count) / total_closed * 100) if total_closed > 0 else 0.0
 
     lines = [
-        "Polymarket status",
-        f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"Free balance: ${balance:.2f}",
-        f"Locked in active bets: ${locked:.2f}",
-        f"Total tracked bankroll: ${total:.2f}",
-        f"Active bets: {len(active_bets)}",
-        f"Closed bets: {len(history)}",
-        f"WON: {won_count} | LOST: {lost_count} | SOLD_EARLY: {sold_count}",
+        f"💰 Free balance: ${balance:.2f}",
+        f"🔒 Locked (Market): ${locked:.2f}",
+        f"💵 Total Assets: ${total:.2f}",
+        f"📈 Net Profit: ${net_profit:.2f}",
+        "",
+        f"🔄 Active bets: {len(active_bets)}",
+        f"📊 Closed bets: {total_closed}",
+        f"🎯 Win Rate: {win_rate:.1f}%",
+        f"✅ WON: {won_count} | 🤑 TP: {tp_count} | 🛡️ SAFE: {safe_count} | ❌ LOST: {lost_count}",
     ]
 
     if active_bets:
-        top_bets = active_bets[:5]
         lines.append("")
         lines.append("Recent active bets:")
+        # Берем последние 5
+        top_bets = active_bets[-5:]
         for bet in top_bets:
             question = bet.get("question", "Unknown market").replace("\n", " ").strip()
-            lines.append(
-                f"- ${float(bet.get('buy_price', 0.0)):.4f} | {question[:80]}"
-            )
+            status = bet.get("status", "ACTIVE")
+            marker = "⏳" if status == "W8_TO_RESOLVE" else "🟢"
+            buy_price = float(bet.get('buy_price', 0.0))
+            lines.append(f"{marker} ${buy_price:.4f} | {question[:60]}...")
 
         remaining = len(active_bets) - len(top_bets)
         if remaining > 0:
@@ -168,14 +177,16 @@ class TelegramNotifier:
             self.ensure_chat_registered(chat)
             self.send_message(
                 chat["id"],
-                "Notifications enabled. I will send periodic Polymarket status updates here.",
+                "✅ Notifications enabled. I will send periodic Polymarket status updates here.",
             )
         elif lowered in {"/status", "/balance"}:
             self.ensure_chat_registered(chat)
-            self.send_message(chat["id"], build_status_message())
+            core = build_core_status()
+            final_msg = f"📊 Polymarket Status\n🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n{core}"
+            self.send_message(chat["id"], final_msg)
         elif lowered in {"/stop", "/unsubscribe", "/stop_notifications"}:
             self.remove_chat(str(chat["id"]))
-            self.send_message(chat["id"], "Notifications disabled for this chat.")
+            self.send_message(chat["id"], "❌ Notifications disabled for this chat.")
 
     def poll_updates(self):
         params = {
@@ -206,18 +217,24 @@ class TelegramNotifier:
             self.last_status_sent_at = now
             return
 
-        status_message = build_status_message()
+        # Берем данные портфеля без времени для сравнения
+        core_status = build_core_status()
+        
+        # Формируем финальное сообщение для отправки (добавляем время)
+        final_message = f"📊 Polymarket Status\n🕒 Time: {datetime.now().strftime('%H:%M:%S')}\n\n{core_status}"
+
         for chat_id in chats:
             chat_state = self.state["chats"].get(chat_id)
             if not chat_state:
                 continue
 
             last_sent_status = chat_state.get("last_sent_status", "")
-            if last_sent_status == status_message:
+            # Если статистика НЕ изменилась с прошлой отправки — молчим
+            if last_sent_status == core_status:
                 continue
 
-            if self.send_message(chat_id, status_message):
-                chat_state["last_sent_status"] = status_message
+            if self.send_message(chat_id, final_message):
+                chat_state["last_sent_status"] = core_status
 
         self.last_status_sent_at = now
         save_subscribers(self.state)
@@ -229,7 +246,6 @@ class TelegramNotifier:
             self.broadcast_status_if_due()
             time.sleep(POLL_INTERVAL_SECONDS)
 
-
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or HARDCODED_TELEGRAM_BOT_TOKEN.strip()
     if not token:
@@ -237,7 +253,6 @@ def main():
 
     notifier = TelegramNotifier(token)
     notifier.run()
-
 
 if __name__ == "__main__":
     main()
