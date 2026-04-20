@@ -472,6 +472,16 @@ def get_balance_snapshot(portfolio):
     )
 
 
+def get_trade_result_snapshot(cost, payout):
+    profit = payout - cost
+    profit_percent = (profit / cost * 100.0) if cost else 0.0
+    sign = "+" if profit >= 0 else ""
+    return (
+        f"Invested: ${cost:.2f} | Received: ${payout:.2f} | "
+        f"PnL: {sign}${profit:.2f} ({sign}{profit_percent:.1f}%)"
+    )
+
+
 def check_portfolio(portfolio):
     if not portfolio["active_bets"]:
         return
@@ -501,10 +511,12 @@ def check_portfolio(portfolio):
 
                         if str(tokens_resolved[bet["outcome_index"]]) == "1":
                             payout = bet["shares"] * 1.0
+                            cost = float(bet.get("cost", 0.0))
                             portfolio["balance"] += payout
                             log(
                                 (
                                     f"✅ WON +${payout:.2f} | {market['question'][:80]}\n"
+                                    f"{get_trade_result_snapshot(cost, payout)}\n"
                                     f"Balance: {get_balance_snapshot(portfolio)}"
                                 ),
                                 notify=True,
@@ -548,11 +560,13 @@ def check_portfolio(portfolio):
                         target_price = bet["buy_price"] * TAKE_PROFIT_MULTIPLIER
                         if current_price >= target_price:
                             payout = bet["shares"] * current_price
+                            cost = float(bet.get("cost", 0.0))
                             portfolio["balance"] += payout
                             log(
                                 (
                                     f"✅ TAKE PROFIT ${bet['buy_price']:.4f} -> "
                                     f"${current_price:.4f} | {market['question'][:80]}\n"
+                                    f"{get_trade_result_snapshot(cost, payout)}\n"
                                     f"Balance: {get_balance_snapshot(portfolio)}"
                                 ),
                                 notify=True,
@@ -570,11 +584,13 @@ def check_portfolio(portfolio):
                                 drop_ratio = current_price / bet["buy_price"]
                                 if drop_ratio >= (1.0 - MAX_DROP_PERCENT):
                                     payout = bet["shares"] * current_price
+                                    cost = float(bet.get("cost", 0.0))
                                     portfolio["balance"] += payout
                                     log(
                                         (
                                             f"✅ SAFE EXIT {minutes_left:.1f}m left, "
                                             f"refund +${payout:.2f} | {market['question'][:80]}\n"
+                                            f"{get_trade_result_snapshot(cost, payout)}\n"
                                             f"Balance: {get_balance_snapshot(portfolio)}"
                                         ),
                                         notify=True,
