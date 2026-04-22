@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import sys
 import threading
@@ -91,6 +92,90 @@ STRATEGY_CONFIGS = [
         stop_loss_ratio=0.5,
         ranking_mode="volume_div_capitalization",
         top_capitalization_fraction=0.30,
+    ),
+    StrategyConfig(
+        strategy_id="volume_liquidity_ratio_v1",
+        title="Volume/Liquidity v1",
+        starting_balance=100.0,
+        bet_amount=1.0,
+        min_price=0.005,
+        max_price=0.02,
+        max_price_inclusive=False,
+        watchlist_min_price=0.021,
+        watchlist_max_price=0.08,
+        max_days_to_expiry=30,
+        take_profit_multiplier=2.0,
+        scanner_threshold=5.0,
+        min_liquidity=500.0,
+        min_volume=1000.0,
+        safe_exit_minutes=4,
+        max_drop_percent=0.90,
+        stop_loss_ratio=0.5,
+        ranking_mode="volume_div_liquidity",
+        top_capitalization_fraction=0.50,
+    ),
+    StrategyConfig(
+        strategy_id="volume_sqrt_liquidity_v1",
+        title="Volume/SqrtLiq v1",
+        starting_balance=100.0,
+        bet_amount=1.0,
+        min_price=0.005,
+        max_price=0.02,
+        max_price_inclusive=False,
+        watchlist_min_price=0.021,
+        watchlist_max_price=0.08,
+        max_days_to_expiry=30,
+        take_profit_multiplier=2.0,
+        scanner_threshold=5.0,
+        min_liquidity=500.0,
+        min_volume=1000.0,
+        safe_exit_minutes=4,
+        max_drop_percent=0.90,
+        stop_loss_ratio=0.5,
+        ranking_mode="volume_div_sqrt_liquidity",
+        top_capitalization_fraction=0.50,
+    ),
+    StrategyConfig(
+        strategy_id="inverse_price_momentum_v1",
+        title="Inverse Price Momentum v1",
+        starting_balance=100.0,
+        bet_amount=1.0,
+        min_price=0.005,
+        max_price=0.02,
+        max_price_inclusive=False,
+        watchlist_min_price=0.021,
+        watchlist_max_price=0.08,
+        max_days_to_expiry=30,
+        take_profit_multiplier=2.5,
+        scanner_threshold=5.0,
+        min_liquidity=500.0,
+        min_volume=1000.0,
+        safe_exit_minutes=4,
+        max_drop_percent=0.90,
+        stop_loss_ratio=0.5,
+        ranking_mode="volume_x_inverse_price",
+        top_capitalization_fraction=0.40,
+    ),
+    StrategyConfig(
+        strategy_id="balanced_log_flow_v1",
+        title="Balanced Log Flow v1",
+        starting_balance=100.0,
+        bet_amount=1.0,
+        min_price=0.005,
+        max_price=0.02,
+        max_price_inclusive=False,
+        watchlist_min_price=0.021,
+        watchlist_max_price=0.08,
+        max_days_to_expiry=30,
+        take_profit_multiplier=2.0,
+        scanner_threshold=5.0,
+        min_liquidity=500.0,
+        min_volume=1000.0,
+        safe_exit_minutes=4,
+        max_drop_percent=0.90,
+        stop_loss_ratio=0.5,
+        ranking_mode="log_volume_x_log_liquidity",
+        top_capitalization_fraction=0.50,
     ),
 ]
 STRATEGY_BY_ID = {config.strategy_id: config for config in STRATEGY_CONFIGS}
@@ -276,18 +361,33 @@ def get_market_capitalization_proxy(market):
         return 0.0
 
 
-def get_market_score(config, market):
+def get_market_score(config, market, price=None):
     try:
         volume = float(market.get("volume", 0))
+        liquidity = float(market.get("liquidity", 0))
         capitalization = get_market_capitalization_proxy(market)
+        safe_price = max(float(price or 0.0), 0.0001)
 
         if config.ranking_mode == "volume_div_capitalization":
             if capitalization <= 0:
                 return 0.0
             return volume / capitalization
+        if config.ranking_mode == "volume_div_liquidity":
+            return volume / max(liquidity, 1.0)
+        if config.ranking_mode == "volume_div_sqrt_liquidity":
+            return volume / max(math.sqrt(liquidity), 1.0)
+        if config.ranking_mode == "log_volume_x_log_liquidity":
+            return math.log(volume + 1.0) * math.log(liquidity + 1.0)
+        if config.ranking_mode == "volume_x_inverse_price":
+            return volume * (1.0 - safe_price)
+        if config.ranking_mode == "volume_div_price":
+            return volume / safe_price
+        if config.ranking_mode == "volume_div_liquidity_div_price":
+            return (volume / max(liquidity, 1.0)) / safe_price
+        if config.ranking_mode == "volume_x_liquidity":
+            return volume * liquidity
 
-        liquidity = float(market.get("liquidity", 0))
-        return volume + (liquidity * 2)
+        return volume + (liquidity * 2.0)
     except Exception:
         return 0.0
 
@@ -756,7 +856,7 @@ def scan_and_execute_strategy(config, state, snapshot):
                 if price_matches_strategy(config, price):
                     candidates.append(
                         {
-                            "score": get_market_score(config, market),
+                            "score": get_market_score(config, market, price),
                             "event": event,
                             "market": market,
                             "outcome_index": outcome_index,
