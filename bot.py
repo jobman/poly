@@ -37,7 +37,6 @@ class StrategyConfig:
     bet_amount: float
     min_price: float
     max_price: float
-    max_price_inclusive: bool = True
     watchlist_min_price: float
     watchlist_max_price: float
     max_days_to_expiry: int
@@ -47,6 +46,7 @@ class StrategyConfig:
     min_volume: float
     safe_exit_minutes: int
     max_drop_percent: float
+    max_price_inclusive: bool = True
     stop_loss_ratio: float | None = None
     ranking_mode: str = "volume_plus_liquidity_x2"
     top_capitalization_fraction: float = 1.0
