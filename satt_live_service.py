@@ -9,10 +9,19 @@ import requests
 
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import MarketOrderArgs, OpenOrderParams, OrderArgs, OrderType
+    from py_clob_client.clob_types import (
+        AssetType,
+        BalanceAllowanceParams,
+        MarketOrderArgs,
+        OpenOrderParams,
+        OrderArgs,
+        OrderType,
+    )
     from py_clob_client.order_builder.constants import BUY, SELL
 except ImportError:  # pragma: no cover - handled at runtime
     ClobClient = None
+    AssetType = None
+    BalanceAllowanceParams = None
     MarketOrderArgs = None
     OpenOrderParams = None
     OrderArgs = None
@@ -22,7 +31,7 @@ except ImportError:  # pragma: no cover - handled at runtime
 
 
 # Strategy settings copied from the tested swing bot
-BET_AMOUNT = 5.0
+BET_AMOUNT = 2.5
 MIN_PRICE = 0.08
 MAX_PRICE = 0.25
 HISTORY_WINDOW_HOURS = 2.0
@@ -35,7 +44,7 @@ COOLDOWN_HOURS = 4.0
 MIN_LIQUIDITY = 5000.0
 MIN_VOLUME = 20000.0
 MIN_DAYS_TO_EXPIRY = 2.0
-CHECK_INTERVAL_SECONDS = 120
+CHECK_INTERVAL_SECONDS = 60
 
 ENV_FILE = ".env"
 GAMMA_API_URL = "https://gamma-api.polymarket.com/events"
@@ -147,6 +156,8 @@ def default_live_sync():
         "open_orders": [],
         "exchange_positions": [],
         "portfolio_value": None,
+        "balance_allowance": None,
+        "available_balance": None,
         "derived_api_creds": None,
     }
 
@@ -229,6 +240,32 @@ class PolymarketExecutionClient:
         except Exception as error:
             log(f"Failed to load open orders: {error}", level="WARNING")
             return []
+
+    def get_balance_allowance(self):
+        if not hasattr(self.client, "get_balance_allowance") or BalanceAllowanceParams is None:
+            return None
+
+        params = BalanceAllowanceParams(
+            asset_type=AssetType.COLLATERAL,
+            signature_type=self.signature_type,
+        )
+        try:
+            result = self.client.get_balance_allowance(params=params)
+            if isinstance(result, dict):
+                return result
+            normalized = {}
+            for source_key, target_key in (
+                ("balance", "balance"),
+                ("allowance", "allowance"),
+                ("available", "available"),
+            ):
+                value = getattr(result, source_key, None)
+                if value is not None:
+                    normalized[target_key] = value
+            return normalized or {"raw": str(result)}
+        except Exception as error:
+            log(f"Failed to load collateral balance/allowance: {error}", level="WARNING")
+            return None
 
     def get_positions(self):
         if not self.profile_address:
@@ -479,12 +516,23 @@ def sync_exchange(execution_client, state):
     open_orders = execution_client.get_open_orders()
     positions = execution_client.get_positions()
     portfolio_value = execution_client.get_total_value()
+    balance_allowance = execution_client.get_balance_allowance()
+    available_balance = None
+    if balance_allowance:
+        try:
+            balance = float(balance_allowance.get("balance") or 0.0)
+            allowance = float(balance_allowance.get("allowance") or 0.0)
+            available_balance = min(balance, allowance)
+        except Exception:
+            available_balance = None
 
     sync_snapshot = {
         "last_sync_at": datetime.now(timezone.utc).isoformat(),
         "open_orders": open_orders,
         "exchange_positions": positions,
         "portfolio_value": portfolio_value,
+        "balance_allowance": balance_allowance,
+        "available_balance": available_balance,
         "derived_api_creds": None,
     }
     save_json(LIVE_SYNC_FILE, sync_snapshot)
@@ -518,6 +566,14 @@ def has_open_order(sync_snapshot, token_id):
 
 
 def attempt_entries(execution_client, state, sync_snapshot):
+    available_balance = sync_snapshot.get("available_balance")
+    if available_balance is not None and available_balance < BET_AMOUNT:
+        log(
+            f"Available collateral ${available_balance:.2f} is below BET_AMOUNT ${BET_AMOUNT:.2f}. "
+            "Skipping new entries."
+        )
+        return False
+
     valid_events = collect_valid_events()
     candidates = maintain_price_history(valid_events)
     if not candidates:
