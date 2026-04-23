@@ -8,6 +8,28 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
+CLIENT_BACKEND = None
+
+try:
+    from py_clob_client_v2 import (
+        ApiCreds as V2ApiCreds,
+        ClobClient as V2ClobClient,
+        MarketOrderArgs as V2MarketOrderArgs,
+        OrderArgs as V2OrderArgs,
+        OrderType as V2OrderType,
+        PartialCreateOrderOptions as V2PartialCreateOrderOptions,
+        Side as V2Side,
+    )
+    CLIENT_BACKEND = "v2"
+except ImportError:  # pragma: no cover
+    V2ApiCreds = None
+    V2ClobClient = None
+    V2MarketOrderArgs = None
+    V2OrderArgs = None
+    V2OrderType = None
+    V2PartialCreateOrderOptions = None
+    V2Side = None
+
 try:
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import (
@@ -19,6 +41,8 @@ try:
         OrderType,
     )
     from py_clob_client.order_builder.constants import BUY, SELL
+    if CLIENT_BACKEND is None:
+        CLIENT_BACKEND = "legacy"
 except ImportError:  # pragma: no cover - handled at runtime
     ClobClient = None
     AssetType = None
@@ -205,9 +229,9 @@ def build_api_creds_object(raw_creds):
 
 class PolymarketExecutionClient:
     def __init__(self):
-        if ClobClient is None:
+        if CLIENT_BACKEND is None:
             raise RuntimeError(
-                "py-clob-client is not installed. Add it to requirements and install dependencies first."
+                "No supported Polymarket CLOB client is installed. Install dependencies first."
             )
 
         self.host = os.getenv("POLYMARKET_CLOB_HOST", DEFAULT_CLOB_HOST).strip()
@@ -220,10 +244,47 @@ class PolymarketExecutionClient:
             or self.funder
         )
         self.client = None
+        self.backend = CLIENT_BACKEND
 
     def initialize(self):
         if not self.private_key:
             raise RuntimeError("POLYMARKET_PRIVATE_KEY is required in .env")
+
+        api_key = os.getenv("POLYMARKET_CLOB_API_KEY", "").strip()
+        api_secret = os.getenv("POLYMARKET_CLOB_SECRET", "").strip()
+        api_passphrase = os.getenv("POLYMARKET_CLOB_PASS_PHRASE", "").strip()
+
+        if self.backend == "v2":
+            creds = None
+            if api_key and api_secret and api_passphrase:
+                creds = V2ApiCreds(
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    api_passphrase=api_passphrase,
+                )
+
+            # v2 docs only show host/chain_id/key/creds; keep constructor minimal.
+            self.client = V2ClobClient(
+                host=self.host,
+                chain_id=self.chain_id,
+                key=self.private_key,
+                creds=creds,
+            )
+
+            if creds is None:
+                creds = self.client.create_or_derive_api_key()
+                log(
+                    "Derived L2 API credentials from wallet via py-clob-client-v2. "
+                    "Save them to .env for stable reuse."
+                )
+                self.client = V2ClobClient(
+                    host=self.host,
+                    chain_id=self.chain_id,
+                    key=self.private_key,
+                    creds=creds,
+                )
+
+            return normalize_api_creds(creds)
 
         self.client = ClobClient(
             self.host,
@@ -232,31 +293,36 @@ class PolymarketExecutionClient:
             signature_type=self.signature_type,
             funder=self.funder,
         )
-
-        api_key = os.getenv("POLYMARKET_CLOB_API_KEY", "").strip()
-        api_secret = os.getenv("POLYMARKET_CLOB_SECRET", "").strip()
-        api_passphrase = os.getenv("POLYMARKET_CLOB_PASS_PHRASE", "").strip()
-
         if api_key and api_secret and api_passphrase:
             creds = build_api_creds_object(
                 {
-                "api_key": api_key,
-                "api_secret": api_secret,
-                "api_passphrase": api_passphrase,
+                    "api_key": api_key,
+                    "api_secret": api_secret,
+                    "api_passphrase": api_passphrase,
                 }
             )
         else:
             creds = self.client.create_or_derive_api_creds()
             log(
-                "Derived L2 API credentials from wallet. "
-                "For stable reuse, add them to .env as "
-                "POLYMARKET_CLOB_API_KEY / POLYMARKET_CLOB_SECRET / POLYMARKET_CLOB_PASS_PHRASE."
+                "Derived L2 API credentials from wallet via legacy py-clob-client. "
+                "Save them to .env for stable reuse."
             )
 
         self.client.set_api_creds(creds)
         return normalize_api_creds(creds)
 
     def get_open_orders(self):
+        if self.backend == "v2":
+            try:
+                if hasattr(self.client, "get_orders"):
+                    return self.client.get_orders() or []
+                if hasattr(self.client, "get_open_orders"):
+                    return self.client.get_open_orders() or []
+            except Exception as error:
+                log(f"Failed to load open orders: {error}", level="WARNING")
+                return []
+            return []
+
         try:
             return self.client.get_orders(OpenOrderParams()) or []
         except Exception as error:
@@ -264,6 +330,20 @@ class PolymarketExecutionClient:
             return []
 
     def get_balance_allowance(self):
+        if self.backend == "v2":
+            # v2 official public README currently documents auth and order placement,
+            # but not a balance/allowance helper. Keep a graceful fallback while the
+            # rest of the service runs on v2.
+            try:
+                if hasattr(self.client, "get_balance_allowance"):
+                    result = self.client.get_balance_allowance()
+                    if isinstance(result, dict):
+                        return result
+                    return normalize_api_creds(result) if result else None
+            except Exception as error:
+                log(f"Failed to load collateral balance/allowance: {error}", level="WARNING")
+            return None
+
         if not hasattr(self.client, "get_balance_allowance") or BalanceAllowanceParams is None:
             return None
 
@@ -326,6 +406,18 @@ class PolymarketExecutionClient:
         return None
 
     def place_market_buy(self, token_id, usdc_amount, tick_size):
+        if self.backend == "v2":
+            return self.client.create_and_post_market_order(
+                order_args=V2MarketOrderArgs(
+                    token_id=str(token_id),
+                    amount=float(usdc_amount),
+                    side=V2Side.BUY,
+                    order_type=V2OrderType.FOK,
+                ),
+                options=V2PartialCreateOrderOptions(tick_size=str(tick_size)),
+                order_type=V2OrderType.FOK,
+            )
+
         order = MarketOrderArgs(
             token_id=str(token_id),
             amount=float(usdc_amount),
@@ -336,6 +428,18 @@ class PolymarketExecutionClient:
         return self.client.post_order(signed, OrderType.FOK)
 
     def place_limit_sell(self, token_id, shares, price):
+        if self.backend == "v2":
+            return self.client.create_and_post_order(
+                order_args=V2OrderArgs(
+                    token_id=str(token_id),
+                    price=float(price),
+                    size=float(shares),
+                    side=V2Side.SELL,
+                ),
+                options=V2PartialCreateOrderOptions(tick_size="0.01"),
+                order_type=V2OrderType.FAK,
+            )
+
         order = OrderArgs(
             token_id=str(token_id),
             price=float(price),
@@ -779,15 +883,15 @@ def attempt_exits(execution_client, state):
 
 def ensure_runtime_ready():
     load_env_file()
-    if ClobClient is None:
+    if CLIENT_BACKEND is None:
         raise RuntimeError(
-            "Missing dependency: py-clob-client. Install requirements before running satt_live_service.py"
+            "Missing dependency: install py-clob-client-v2 (preferred) or py-clob-client before running satt_live_service.py"
         )
 
 
 def main():
     ensure_runtime_ready()
-    log("Starting live swing service for Polymarket.")
+    log(f"Starting live swing service for Polymarket. CLOB backend: {CLIENT_BACKEND}")
 
     state = load_json(LIVE_STATE_FILE, default_live_state())
     cleanup_cooldowns(state)
