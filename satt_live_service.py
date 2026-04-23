@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import traceback
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -183,6 +184,25 @@ def normalize_api_creds(creds):
     return result or {"raw": str(creds)}
 
 
+def build_api_creds_object(raw_creds):
+    if raw_creds is None:
+        return None
+    if all(hasattr(raw_creds, attr) for attr in ("api_key", "api_secret", "api_passphrase")):
+        return raw_creds
+
+    if isinstance(raw_creds, dict):
+        api_key = raw_creds.get("api_key") or raw_creds.get("key")
+        api_secret = raw_creds.get("api_secret") or raw_creds.get("secret")
+        api_passphrase = raw_creds.get("api_passphrase") or raw_creds.get("passphrase")
+        return SimpleNamespace(
+            api_key=api_key,
+            api_secret=api_secret,
+            api_passphrase=api_passphrase,
+        )
+
+    return raw_creds
+
+
 class PolymarketExecutionClient:
     def __init__(self):
         if ClobClient is None:
@@ -218,11 +238,13 @@ class PolymarketExecutionClient:
         api_passphrase = os.getenv("POLYMARKET_CLOB_PASS_PHRASE", "").strip()
 
         if api_key and api_secret and api_passphrase:
-            creds = {
+            creds = build_api_creds_object(
+                {
                 "api_key": api_key,
                 "api_secret": api_secret,
                 "api_passphrase": api_passphrase,
-            }
+                }
+            )
         else:
             creds = self.client.create_or_derive_api_creds()
             log(
