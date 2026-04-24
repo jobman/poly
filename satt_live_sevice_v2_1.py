@@ -249,6 +249,7 @@ def start_telegram_bot():
                 allowed_updates=Update.ALL_TYPES,
                 drop_pending_updates=True,
                 close_loop=False,
+                stop_signals=None,
             )
         except Exception as error:
             log(f"Telegram bot stopped: {error}", level="ERROR", tg=True)
