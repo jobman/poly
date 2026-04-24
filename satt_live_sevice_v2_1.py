@@ -19,6 +19,13 @@ from py_clob_client_v2 import (
 )
 from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
 
+# Загружаем переменные окружения здесь, чтобы были доступны токены Telegram
+load_dotenv(".env")
+
+# --- Telegram settings ---
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_ADMIN_IDS = os.getenv("TELEGRAM_ADMIN_IDS", "").strip()
+
 # --- Strategy settings ---
 BET_AMOUNT = 2.5
 MIN_PRICE = 0.08
@@ -51,6 +58,34 @@ http_session.headers.update(
     }
 )
 
+def send_telegram_message(text):
+    """Функция для отправки уведомлений списку администраторов в Telegram"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_ADMIN_IDS:
+        return
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    
+    # Разбиваем строку с ID по запятой и убираем лишние пробелы
+    admin_ids =[admin_id.strip() for admin_id in TELEGRAM_ADMIN_IDS.split(",") if admin_id.strip()]
+    
+    for chat_id in admin_ids:
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
+        }
+        try:
+            requests.post(url, json=payload, timeout=5)
+        except Exception as e:
+            print(f"⚠️ Ошибка отправки в Telegram пользователю {chat_id}: {e}")
+
+def log(message, level="INFO", tg=False):
+    """tg=True отправит это сообщение еще и всем админам в Telegram"""
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {message}")
+    if tg:
+        send_telegram_message(f"<b>[{level}]</b>\n{message}")
+
 def load_json(path, default):
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as file:
@@ -60,9 +95,6 @@ def load_json(path, default):
 def save_json(path, data):
     with open(path, "w", encoding="utf-8") as file:
         json.dump(data, file, indent=4, ensure_ascii=False)
-
-def log(message, level="INFO"):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {message}")
 
 def parse_token_ids(market):
     raw = market.get("clobTokenIds", "[]")
@@ -103,7 +135,7 @@ def round_price_to_tick(price, tick_size):
 def default_live_state():
     return {
         "service": "satt_live_service",
-        "active_positions": [],
+        "active_positions":[],
         "journal":[],
         "cooldowns": {},
         "last_cycle_at": None,
@@ -112,9 +144,6 @@ def default_live_state():
 # --- ИНТЕГРАЦИЯ С POLYMARKET V2 ---
 class PolymarketExecutionClient:
     def __init__(self):
-        # Загружаем переменные окружения
-        load_dotenv(ENV_FILE)
-        
         self.host = os.getenv("POLYMARKET_CLOB_HOST", "https://clob.polymarket.com").strip()
         self.chain_id = int(os.getenv("POLYMARKET_CHAIN_ID", "137"))
         self.private_key = os.getenv("POLYMARKET_PRIVATE_KEY", "").strip()
@@ -130,7 +159,6 @@ class PolymarketExecutionClient:
 
         log(f"Initializing V2 ClobClient... (Signature Type: {self.signature_type})")
         
-        # Шаг 1: Создаем временный клиент для деривации L2 ключей с ПРАВИЛЬНЫМИ funder и signature_type
         temp_client = ClobClient(
             host=self.host, 
             key=self.private_key, 
@@ -140,7 +168,6 @@ class PolymarketExecutionClient:
         )
         api_creds = temp_client.create_or_derive_api_key()
         
-        # Шаг 2: Инициализируем полноценный торговый клиент
         self.client = ClobClient(
             host=self.host,
             key=self.private_key,
@@ -154,13 +181,12 @@ class PolymarketExecutionClient:
 
     def get_open_orders(self):
         try:
-            # Безопасная проверка на существование метода
             if hasattr(self.client, 'get_orders'):
                 return self.client.get_orders() or[]
             elif hasattr(self.client, 'get_open_orders'):
-                return self.client.get_open_orders() or []
+                return self.client.get_open_orders() or[]
             return[]
-        except Exception as error:
+        except Exception:
             return[]
 
     def get_balance_allowance(self):
@@ -220,7 +246,6 @@ class PolymarketExecutionClient:
             )
             return response
         except Exception as e:
-            log(f"Error placing Market BUY: {e}", "ERROR")
             raise e
 
     def place_limit_sell(self, token_id, shares, price, tick_size="0.01"):
@@ -237,9 +262,7 @@ class PolymarketExecutionClient:
             )
             return response
         except Exception as e:
-            log(f"Error placing Limit SELL: {e}", "ERROR")
             raise e
-
 
 # --- ЛОГИКА СТРАТЕГИИ ---
 
@@ -435,8 +458,6 @@ def sync_exchange(execution_client, state):
     available_balance = None
     if balance_allowance:
         try:
-            # Приводим сырой баланс к долларам (делим на 1 миллион)
-            # Proxy-кошелькам не требуется проверять allowance
             balance_raw = float(balance_allowance.get("balance", 0.0))
             available_balance = balance_raw / 1_000_000.0
         except Exception:
@@ -524,11 +545,15 @@ def attempt_entries(execution_client, state, sync_snapshot):
                     "response": response,
                 },
             )
-            log((
-                f"📉 LIVE BUY submitted | {candidate['outcome']} @ ~${candidate['current_price']:.3f}\n"
+            # Отправляем сообщение в Telegram всем админам (tg=True)
+            msg = (
+                f"📉 <b>LIVE BUY submitted</b>\n"
+                f"Outcome: {candidate['outcome']} @ ~${candidate['current_price']:.3f}\n"
                 f"Target TP: ${candidate['target_price']:.3f} (+{candidate['expected_profit_pct']:.1f}%)\n"
-                f"Market: {candidate['question'][:80]}"
-            ))
+                f"Market: <i>{candidate['question'][:80]}</i>"
+            )
+            log(msg, tg=True)
+            
             did_trade = True
             sync_snapshot = sync_exchange(execution_client, state)
 
@@ -549,7 +574,7 @@ def attempt_entries(execution_client, state, sync_snapshot):
             break
         except Exception as error:
             journal_entry(state, "BUY_FAILED", {"market_id": candidate["market_id"], "token_id": candidate["token_id"], "error": str(error)})
-            log(f"Live BUY failed: {error}", level="ERROR")
+            log(f"Live BUY failed: {error}", level="ERROR", tg=True)
             save_json(LIVE_STATE_FILE, state)
 
     return did_trade
@@ -575,12 +600,14 @@ def close_position(execution_client, state, position, reason, sell_price, journa
                 "response": response,
             },
         )
-        log(f"{reason} | {position.get('question', 'Unknown market')[:80]}")
+        # Отправляем сообщение о продаже всем админам
+        msg = f"{reason}\nMarket: <i>{position.get('question', 'Unknown market')[:80]}</i>"
+        log(msg, tg=True)
         save_json(LIVE_STATE_FILE, state)
         return True
     except Exception as error:
         journal_entry(state, f"{journal_action}_FAILED", {"asset_id": position["asset_id"], "reason": reason, "error": str(error)})
-        log(f"{reason} failed: {error}", level="ERROR")
+        log(f"{reason} failed: {error}", level="ERROR", tg=True)
         save_json(LIVE_STATE_FILE, state)
         return False
 
@@ -628,7 +655,7 @@ def attempt_exits(execution_client, state):
     return did_trade
 
 def main():
-    log(f"Starting live swing service for Polymarket. Using py-clob-client V2.")
+    log(f"Starting live swing service for Polymarket. Using py-clob-client V2.", tg=True)
 
     state = load_json(LIVE_STATE_FILE, default_live_state())
     cleanup_cooldowns(state)
@@ -638,7 +665,7 @@ def main():
         execution_client = PolymarketExecutionClient()
         execution_client.initialize()
     except Exception as e:
-        log(f"Failed to initialize Polymarket client: {e}", "ERROR")
+        log(f"Failed to initialize Polymarket client: {e}", "ERROR", tg=True)
         sys.exit(1)
 
     sync_snapshot = sync_exchange(execution_client, state)
@@ -651,7 +678,8 @@ def main():
     
     log(
         f"Initial sync complete. Positions: {len(sync_snapshot['exchange_positions'])} | "
-        f"Portfolio value: {val_str} | Available Balance: {bal_str}"
+        f"Portfolio value: {val_str} | Available Balance: {bal_str}", 
+        tg=True
     )
 
     try:
@@ -669,10 +697,11 @@ def main():
                 log(f"Network error: {error}", level="WARNING")
                 time.sleep(CHECK_INTERVAL_SECONDS)
             except Exception:
-                log(f"Cycle failure:\n{traceback.format_exc()}", level="ERROR")
+                err_trace = traceback.format_exc()
+                log(f"Cycle failure:\n{err_trace}", level="ERROR", tg=True)
                 time.sleep(CHECK_INTERVAL_SECONDS)
     except KeyboardInterrupt:
-        log("Live swing service stopped by user.")
+        log("Live swing service stopped by user.", tg=True)
 
 if __name__ == "__main__":
     main()
