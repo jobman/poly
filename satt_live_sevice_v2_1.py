@@ -1,12 +1,15 @@
 import json
 import os
 import sys
+import threading
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 import requests
+from telegram import ReplyKeyboardMarkup, Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
 # --- Чистые импорты V2 (py-clob-client-v2) ---
 from py_clob_client_v2 import (
@@ -62,6 +65,10 @@ http_session.headers.update(
     }
 )
 
+telegram_state_lock = threading.Lock()
+telegram_shared_state = None
+telegram_shared_snapshot = {}
+
 def send_telegram_message(text):
     """Функция для отправки уведомлений списку администраторов в Telegram"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_ADMIN_IDS:
@@ -88,11 +95,11 @@ def get_admin_ids():
     return [admin_id.strip() for admin_id in TELEGRAM_ADMIN_IDS.split(",") if admin_id.strip()]
 
 def build_reply_keyboard():
-    return {
-        "keyboard": [[{"text": TELEGRAM_MENU_BUTTON_STATS}]],
-        "resize_keyboard": True,
-        "persistent": True,
-    }
+    return ReplyKeyboardMarkup(
+        [[TELEGRAM_MENU_BUTTON_STATS]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
 
 def send_telegram_chat_message(chat_id, text, reply_markup=None):
     if not TELEGRAM_BOT_TOKEN or not chat_id:
@@ -112,25 +119,6 @@ def send_telegram_chat_message(chat_id, text, reply_markup=None):
         requests.post(url, json=payload, timeout=10)
     except Exception as error:
         print(f"⚠️ Ошибка отправки сообщения в Telegram {chat_id}: {error}")
-
-def get_telegram_updates(offset=None, timeout=0):
-    if not TELEGRAM_BOT_TOKEN:
-        return []
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    params = {"timeout": timeout}
-    if offset is not None:
-        params["offset"] = offset
-
-    try:
-        response = requests.get(url, params=params, timeout=timeout + 10)
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("ok"):
-            return payload.get("result", [])
-    except Exception as error:
-        log(f"Telegram polling error: {error}", level="WARNING")
-    return []
 
 def log(message, level="INFO", tg=False):
     """tg=True отправит это сообщение еще и всем админам в Telegram"""
@@ -201,6 +189,69 @@ def default_live_state():
         "cooldowns": {},
         "last_cycle_at": None,
     }
+
+def update_telegram_runtime_state(state, sync_snapshot):
+    global telegram_shared_state, telegram_shared_snapshot
+    with telegram_state_lock:
+        telegram_shared_state = json.loads(json.dumps(state))
+        telegram_shared_snapshot = json.loads(json.dumps(sync_snapshot))
+
+def get_telegram_runtime_state():
+    with telegram_state_lock:
+        state = json.loads(json.dumps(telegram_shared_state or default_live_state()))
+        snapshot = json.loads(json.dumps(telegram_shared_snapshot or {}))
+    return state, snapshot
+
+def is_telegram_admin(chat_id):
+    return str(chat_id) in set(get_admin_ids())
+
+async def telegram_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or not is_telegram_admin(update.effective_chat.id):
+        return
+    await update.effective_chat.send_message(
+        "Меню открыто. Используй кнопку «Статистика» ниже.",
+        reply_markup=build_reply_keyboard(),
+    )
+
+async def telegram_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or not is_telegram_admin(update.effective_chat.id):
+        return
+    state, sync_snapshot = get_telegram_runtime_state()
+    await update.effective_chat.send_message(format_statistics_message(state, sync_snapshot))
+
+async def telegram_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or not update.effective_message:
+        return
+    if not is_telegram_admin(update.effective_chat.id):
+        return
+
+    text = (update.effective_message.text or "").strip().lower()
+    if text == "menu":
+        await telegram_menu_handler(update, context)
+    elif text == TELEGRAM_MENU_BUTTON_STATS.lower():
+        await telegram_stats_handler(update, context)
+
+def start_telegram_bot():
+    if not TELEGRAM_BOT_TOKEN:
+        return None
+
+    def run_bot():
+        try:
+            application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+            application.add_handler(CommandHandler("menu", telegram_menu_handler))
+            application.add_handler(CommandHandler("stats", telegram_stats_handler))
+            application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, telegram_text_handler))
+            application.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+                close_loop=False,
+            )
+        except Exception as error:
+            log(f"Telegram bot stopped: {error}", level="ERROR", tg=True)
+
+    bot_thread = threading.Thread(target=run_bot, name="telegram-bot", daemon=True)
+    bot_thread.start()
+    return bot_thread
 
 # --- ИНТЕГРАЦИЯ С POLYMARKET V2 ---
 class PolymarketExecutionClient:
@@ -578,40 +629,6 @@ def format_statistics_message(state, sync_snapshot):
         f"⛔SL:{counts['SL']} | ❌LOST:{counts['LOST']}"
     )
 
-def handle_telegram_command(chat_id, text, state, sync_snapshot):
-    normalized = (text or "").strip().lower()
-    if normalized == "menu":
-        send_telegram_chat_message(
-            chat_id,
-            "Меню открыто. Используй кнопку «Статистика» ниже.",
-            reply_markup=build_reply_keyboard(),
-        )
-        return
-
-    if normalized == TELEGRAM_MENU_BUTTON_STATS.lower():
-        send_telegram_chat_message(chat_id, format_statistics_message(state, sync_snapshot))
-
-def process_telegram_updates(state, sync_snapshot, next_update_id):
-    updates = get_telegram_updates(offset=next_update_id, timeout=0)
-    max_update_id = next_update_id
-    admin_ids = set(get_admin_ids())
-
-    for update in updates:
-        update_id = update.get("update_id")
-        if isinstance(update_id, int):
-            max_update_id = max(max_update_id or 0, update_id + 1)
-
-        message = update.get("message") or update.get("edited_message") or {}
-        chat = message.get("chat") or {}
-        chat_id = str(chat.get("id") or "")
-        text = message.get("text") or ""
-        if not chat_id or not text or chat_id not in admin_ids:
-            continue
-
-        handle_telegram_command(chat_id, text, state, sync_snapshot)
-
-    return max_update_id
-
 def sync_exchange(execution_client, state):
     open_orders = execution_client.get_open_orders()
     positions = execution_client.get_positions()
@@ -844,12 +861,8 @@ def main():
 
     sync_snapshot = sync_exchange(execution_client, state)
     save_json(LIVE_SYNC_FILE, sync_snapshot)
-    next_update_id = None
-    initial_updates = get_telegram_updates(timeout=0)
-    for update in initial_updates:
-        update_id = update.get("update_id")
-        if isinstance(update_id, int):
-            next_update_id = max(next_update_id or 0, update_id + 1)
+    update_telegram_runtime_state(state, sync_snapshot)
+    start_telegram_bot()
 
     val = sync_snapshot.get('portfolio_value')
     val_str = f"${val:.2f}" if val is not None else "Unknown"
@@ -867,13 +880,14 @@ def main():
             try:
                 cleanup_cooldowns(state)
                 sync_snapshot = sync_exchange(execution_client, state)
-                next_update_id = process_telegram_updates(state, sync_snapshot, next_update_id)
+                update_telegram_runtime_state(state, sync_snapshot)
                 attempt_exits(execution_client, state)
                 sync_snapshot = sync_exchange(execution_client, state)
-                next_update_id = process_telegram_updates(state, sync_snapshot, next_update_id)
+                update_telegram_runtime_state(state, sync_snapshot)
                 attempt_entries(execution_client, state, sync_snapshot)
                 state["last_cycle_at"] = datetime.now(timezone.utc).isoformat()
                 save_json(LIVE_STATE_FILE, state)
+                update_telegram_runtime_state(state, sync_snapshot)
                 time.sleep(CHECK_INTERVAL_SECONDS)
             except requests.exceptions.RequestException as error:
                 log(f"Network error: {error}", level="WARNING")
