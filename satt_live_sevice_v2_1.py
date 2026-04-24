@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import asyncio
 import threading
 import time
 import traceback
@@ -236,7 +237,10 @@ def start_telegram_bot():
         return None
 
     def run_bot():
+        loop = None
         try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
             application.add_handler(CommandHandler("menu", telegram_menu_handler))
             application.add_handler(CommandHandler("stats", telegram_stats_handler))
@@ -248,6 +252,10 @@ def start_telegram_bot():
             )
         except Exception as error:
             log(f"Telegram bot stopped: {error}", level="ERROR", tg=True)
+        finally:
+            asyncio.set_event_loop(None)
+            if loop is not None and not loop.is_closed():
+                loop.close()
 
     bot_thread = threading.Thread(target=run_bot, name="telegram-bot", daemon=True)
     bot_thread.start()
