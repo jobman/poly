@@ -559,7 +559,7 @@ def has_pending_exit(state, token_id=None, market_id=None):
             return True
     return False
 
-def queue_pending_exit(state, position, reason, journal_action, sell_price):
+def queue_pending_exit(state, position, reason, journal_action, sell_price, sync_snapshot=None):
     asset_id = str(position.get("asset_id"))
     pending_exits = state.setdefault("pending_exits", {})
     pending = pending_exits.get(asset_id)
@@ -577,14 +577,22 @@ def queue_pending_exit(state, position, reason, journal_action, sell_price):
         "first_detected_at": datetime.now(timezone.utc).isoformat(),
         "last_attempt_ts": 0.0,
         "attempts": 0,
+        "entry_price": safe_float(position.get("avg_price", position.get("buy_price", 0.0))),
+        "entry_cost": safe_float(position.get("cost")),
+        "initial_shares": safe_float(position.get("shares")),
         "last_known_shares": safe_float(position.get("shares")),
+        "available_balance_before_exit": (
+            safe_float(sync_snapshot.get("available_balance"), default=None)
+            if sync_snapshot is not None and sync_snapshot.get("available_balance") is not None
+            else None
+        ),
         "completion_recorded": False,
     }
     pending_exits[asset_id] = pending
     save_json(LIVE_STATE_FILE, state)
     return pending
 
-def finalize_completed_pending_exits(state):
+def finalize_completed_pending_exits(state, sync_snapshot=None):
     pending_exits = state.setdefault("pending_exits", {})
     active_asset_ids = {str(position.get("asset_id")) for position in state.get("active_positions", [])}
 
@@ -594,6 +602,30 @@ def finalize_completed_pending_exits(state):
             continue
 
         if not pending.get("completion_recorded"):
+            available_balance_after = (
+                safe_float(sync_snapshot.get("available_balance"), default=None)
+                if sync_snapshot is not None and sync_snapshot.get("available_balance") is not None
+                else None
+            )
+            available_balance_before = pending.get("available_balance_before_exit")
+            realized_proceeds = None
+            if available_balance_before is not None and available_balance_after is not None:
+                realized_proceeds = available_balance_after - available_balance_before
+
+            entry_cost = safe_float(pending.get("entry_cost"))
+            initial_shares = safe_float(pending.get("initial_shares"))
+            actual_sell_price = None
+            if realized_proceeds is not None and initial_shares > 0:
+                actual_sell_price = realized_proceeds / initial_shares
+            if actual_sell_price is None or actual_sell_price <= 0:
+                actual_sell_price = safe_float(pending.get("sell_price"), default=None)
+
+            pnl_usdc = None
+            pnl_pct = None
+            if realized_proceeds is not None and entry_cost > 0:
+                pnl_usdc = realized_proceeds - entry_cost
+                pnl_pct = (pnl_usdc / entry_cost) * 100.0
+
             journal_entry(
                 state,
                 pending.get("journal_action", "SELL_COMPLETED"),
@@ -601,18 +633,28 @@ def finalize_completed_pending_exits(state):
                     "asset_id": asset_id,
                     "question": pending.get("question"),
                     "outcome": pending.get("outcome"),
-                    "sell_price": pending.get("sell_price"),
+                    "entry_price": pending.get("entry_price"),
+                    "entry_cost": entry_cost,
+                    "initial_shares": initial_shares,
+                    "sell_price": actual_sell_price,
+                    "estimated_sell_price": pending.get("sell_price"),
+                    "realized_proceeds": realized_proceeds,
+                    "pnl_usdc": pnl_usdc,
+                    "pnl_pct": pnl_pct,
                     "reason": pending.get("reason"),
                     "attempts": pending.get("attempts", 0),
                     "completed_via": "pending_exit",
                 },
             )
             pending["completion_recorded"] = True
-            log(
-                f"✅ EXIT COMPLETED after {pending.get('attempts', 0)} attempt(s)\n"
-                f"Market: <i>{str(pending.get('question', 'Unknown market'))[:80]}</i>",
-                tg=True,
-            )
+            summary = [
+                f"✅ EXIT COMPLETED after {pending.get('attempts', 0)} attempt(s)",
+                f"Buy: ${safe_float(pending.get('entry_price')):.3f} | Sell: ${safe_float(actual_sell_price):.3f}",
+            ]
+            if pnl_usdc is not None and pnl_pct is not None:
+                summary.append(f"PnL: {pnl_usdc:+.3f} USDC ({pnl_pct:+.2f}%)")
+            summary.append(f"Market: <i>{str(pending.get('question', 'Unknown market'))[:80]}</i>")
+            log("\n".join(summary), tg=True)
 
         pending_exits.pop(asset_id, None)
 
@@ -994,11 +1036,11 @@ def attempt_entries(execution_client, state, sync_snapshot):
 
     return did_trade
 
-def close_position(execution_client, state, position, reason, sell_price, journal_action):
-    queue_pending_exit(state, position, reason, journal_action, sell_price)
+def close_position(execution_client, state, position, reason, sell_price, journal_action, sync_snapshot=None):
+    queue_pending_exit(state, position, reason, journal_action, sell_price, sync_snapshot=sync_snapshot)
     return attempt_pending_exits(execution_client, state, force_asset_id=position["asset_id"])
 
-def attempt_exits(execution_client, state):
+def attempt_exits(execution_client, state, sync_snapshot=None):
     did_trade = False
     now = datetime.now(timezone.utc)
 
@@ -1032,13 +1074,13 @@ def attempt_exits(execution_client, state):
 
         if avg_price > 0 and current_price >= target_price:
             sell_price = round_price_to_tick(current_price, tick_size)
-            if close_position(execution_client, state, position, f"🤑 DYNAMIC TP HIT @ ${sell_price:.3f}", sell_price, "SELL_TAKE_PROFIT"):
+            if close_position(execution_client, state, position, f"🤑 DYNAMIC TP HIT @ ${sell_price:.3f}", sell_price, "SELL_TAKE_PROFIT", sync_snapshot=sync_snapshot):
                 did_trade = True
                 break
 
         if avg_price > 0 and current_price <= avg_price * STOP_LOSS_MULTIPLIER:
             sell_price = round_price_to_tick(current_price, tick_size)
-            if close_position(execution_client, state, position, f"⛔ STOP LOSS HIT @ ${sell_price:.3f}", sell_price, "SELL_STOP_LOSS"):
+            if close_position(execution_client, state, position, f"⛔ STOP LOSS HIT @ ${sell_price:.3f}", sell_price, "SELL_STOP_LOSS", sync_snapshot=sync_snapshot):
                 cooldown_until = (now + timedelta(hours=COOLDOWN_HOURS)).timestamp()
                 market_id = str(position.get("market_id") or "")
                 if market_id:
@@ -1048,7 +1090,7 @@ def attempt_exits(execution_client, state):
 
         if hours_held >= MAX_HOLD_HOURS:
             sell_price = round_price_to_tick(current_price, tick_size)
-            if close_position(execution_client, state, position, f"⏱️ TIME STOP ({MAX_HOLD_HOURS}h) @ ${sell_price:.3f}", sell_price, "SELL_TIME_STOP"):
+            if close_position(execution_client, state, position, f"⏱️ TIME STOP ({MAX_HOLD_HOURS}h) @ ${sell_price:.3f}", sell_price, "SELL_TIME_STOP", sync_snapshot=sync_snapshot):
                 did_trade = True
                 break
 
@@ -1089,15 +1131,15 @@ def main():
             try:
                 cleanup_cooldowns(state)
                 sync_snapshot = sync_exchange(execution_client, state)
-                finalize_completed_pending_exits(state)
+                finalize_completed_pending_exits(state, sync_snapshot)
                 update_telegram_runtime_state(state, sync_snapshot)
                 if attempt_pending_exits(execution_client, state):
                     sync_snapshot = sync_exchange(execution_client, state)
-                    finalize_completed_pending_exits(state)
+                    finalize_completed_pending_exits(state, sync_snapshot)
                     update_telegram_runtime_state(state, sync_snapshot)
-                attempt_exits(execution_client, state)
+                attempt_exits(execution_client, state, sync_snapshot)
                 sync_snapshot = sync_exchange(execution_client, state)
-                finalize_completed_pending_exits(state)
+                finalize_completed_pending_exits(state, sync_snapshot)
                 update_telegram_runtime_state(state, sync_snapshot)
                 attempt_entries(execution_client, state, sync_snapshot)
                 state["last_cycle_at"] = datetime.now(timezone.utc).isoformat()
