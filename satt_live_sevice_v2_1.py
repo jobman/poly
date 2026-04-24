@@ -25,6 +25,9 @@ load_dotenv(".env")
 # --- Telegram settings ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_ADMIN_IDS = os.getenv("TELEGRAM_ADMIN_IDS", "").strip()
+TELEGRAM_MENU_BUTTON_STATS = "Статистика"
+STRATEGY_DISPLAY_NAME = os.getenv("STRATEGY_DISPLAY_NAME", "Balanced Log Flow v1").strip() or "Balanced Log Flow v1"
+STARTING_BALANCE = float(os.getenv("STARTING_BALANCE", "100"))
 
 # --- Strategy settings ---
 BET_AMOUNT = 2.5
@@ -80,6 +83,54 @@ def send_telegram_message(text):
             requests.post(url, json=payload, timeout=5)
         except Exception as e:
             print(f"⚠️ Ошибка отправки в Telegram пользователю {chat_id}: {e}")
+
+def get_admin_ids():
+    return [admin_id.strip() for admin_id in TELEGRAM_ADMIN_IDS.split(",") if admin_id.strip()]
+
+def build_reply_keyboard():
+    return {
+        "keyboard": [[{"text": TELEGRAM_MENU_BUTTON_STATS}]],
+        "resize_keyboard": True,
+        "persistent": True,
+    }
+
+def send_telegram_chat_message(chat_id, text, reply_markup=None):
+    if not TELEGRAM_BOT_TOKEN or not chat_id:
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": str(chat_id),
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as error:
+        print(f"⚠️ Ошибка отправки сообщения в Telegram {chat_id}: {error}")
+
+def get_telegram_updates(offset=None, timeout=0):
+    if not TELEGRAM_BOT_TOKEN:
+        return []
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params = {"timeout": timeout}
+    if offset is not None:
+        params["offset"] = offset
+
+    try:
+        response = requests.get(url, params=params, timeout=timeout + 10)
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("ok"):
+            return payload.get("result", [])
+    except Exception as error:
+        log(f"Telegram polling error: {error}", level="WARNING")
+    return []
 
 def log(message, level="INFO", tg=False):
     """tg=True отправит это сообщение еще и всем админам в Telegram"""
@@ -466,6 +517,101 @@ def get_positions_current_value(positions):
         total += safe_float(position.get("currentValue"))
     return total
 
+def get_stat_counts(state):
+    counts = {
+        "WON": 0,
+        "TP": 0,
+        "SAFE": 0,
+        "SL": 0,
+        "LOST": 0,
+        "CLOSED": 0,
+    }
+
+    for entry in state.get("journal", []):
+        action = str(entry.get("action") or "")
+        if action.endswith("_FAILED"):
+            continue
+
+        if action == "SELL_TAKE_PROFIT":
+            counts["TP"] += 1
+            counts["CLOSED"] += 1
+        elif action == "SELL_TIME_STOP":
+            counts["SAFE"] += 1
+            counts["CLOSED"] += 1
+        elif action == "SELL_STOP_LOSS":
+            counts["SL"] += 1
+            counts["CLOSED"] += 1
+        elif action == "SELL_WON":
+            counts["WON"] += 1
+            counts["CLOSED"] += 1
+        elif action == "SELL_LOST":
+            counts["LOST"] += 1
+            counts["CLOSED"] += 1
+
+    return counts
+
+def format_statistics_message(state, sync_snapshot):
+    available_balance = safe_float(sync_snapshot.get("available_balance"))
+    locked_value = safe_float(sync_snapshot.get("positions_current_value"))
+    total_assets = sync_snapshot.get("portfolio_value")
+    if total_assets is None:
+        total_assets = available_balance + locked_value
+    total_assets = safe_float(total_assets)
+
+    counts = get_stat_counts(state)
+    closed_count = counts["CLOSED"]
+    active_count = len(state.get("active_positions", []))
+    positive_closed = counts["WON"] + counts["TP"] + counts["SAFE"]
+    win_rate = (positive_closed / closed_count * 100.0) if closed_count else 0.0
+    net_profit = total_assets - STARTING_BALANCE
+
+    return (
+        f"📊 {STRATEGY_DISPLAY_NAME}\n"
+        f"🕒 {datetime.now().strftime('%H:%M:%S')}\n\n"
+        f"💰 Free balance: ${available_balance:.2f}\n"
+        f"🔒 Locked: ${locked_value:.2f}\n"
+        f"💵 Total Assets: ${total_assets:.2f}\n"
+        f"📈 Net Profit: ${net_profit:.2f}\n\n"
+        f"🔄 Active: {active_count} | 📊 Closed: {closed_count}\n"
+        f"🎯 Win Rate: {win_rate:.1f}%\n"
+        f"✅WON:{counts['WON']} | 🤑TP:{counts['TP']} | 🛡️SAFE:{counts['SAFE']} | "
+        f"⛔SL:{counts['SL']} | ❌LOST:{counts['LOST']}"
+    )
+
+def handle_telegram_command(chat_id, text, state, sync_snapshot):
+    normalized = (text or "").strip().lower()
+    if normalized == "menu":
+        send_telegram_chat_message(
+            chat_id,
+            "Меню открыто. Используй кнопку «Статистика» ниже.",
+            reply_markup=build_reply_keyboard(),
+        )
+        return
+
+    if normalized == TELEGRAM_MENU_BUTTON_STATS.lower():
+        send_telegram_chat_message(chat_id, format_statistics_message(state, sync_snapshot))
+
+def process_telegram_updates(state, sync_snapshot, next_update_id):
+    updates = get_telegram_updates(offset=next_update_id, timeout=0)
+    max_update_id = next_update_id
+    admin_ids = set(get_admin_ids())
+
+    for update in updates:
+        update_id = update.get("update_id")
+        if isinstance(update_id, int):
+            max_update_id = max(max_update_id or 0, update_id + 1)
+
+        message = update.get("message") or update.get("edited_message") or {}
+        chat = message.get("chat") or {}
+        chat_id = str(chat.get("id") or "")
+        text = message.get("text") or ""
+        if not chat_id or not text or chat_id not in admin_ids:
+            continue
+
+        handle_telegram_command(chat_id, text, state, sync_snapshot)
+
+    return max_update_id
+
 def sync_exchange(execution_client, state):
     open_orders = execution_client.get_open_orders()
     positions = execution_client.get_positions()
@@ -698,6 +844,12 @@ def main():
 
     sync_snapshot = sync_exchange(execution_client, state)
     save_json(LIVE_SYNC_FILE, sync_snapshot)
+    next_update_id = None
+    initial_updates = get_telegram_updates(timeout=0)
+    for update in initial_updates:
+        update_id = update.get("update_id")
+        if isinstance(update_id, int):
+            next_update_id = max(next_update_id or 0, update_id + 1)
 
     val = sync_snapshot.get('portfolio_value')
     val_str = f"${val:.2f}" if val is not None else "Unknown"
@@ -715,8 +867,10 @@ def main():
             try:
                 cleanup_cooldowns(state)
                 sync_snapshot = sync_exchange(execution_client, state)
+                next_update_id = process_telegram_updates(state, sync_snapshot, next_update_id)
                 attempt_exits(execution_client, state)
                 sync_snapshot = sync_exchange(execution_client, state)
+                next_update_id = process_telegram_updates(state, sync_snapshot, next_update_id)
                 attempt_entries(execution_client, state, sync_snapshot)
                 state["last_cycle_at"] = datetime.now(timezone.utc).isoformat()
                 save_json(LIVE_STATE_FILE, state)
