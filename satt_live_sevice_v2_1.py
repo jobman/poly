@@ -48,6 +48,7 @@ MIN_LIQUIDITY = 5000.0
 MIN_VOLUME = 20000.0
 MIN_DAYS_TO_EXPIRY = 2.0
 CHECK_INTERVAL_SECONDS = 30
+EXIT_RETRY_SECONDS = 10
 
 ENV_FILE = ".env"
 GAMMA_API_URL = "https://gamma-api.polymarket.com/events"
@@ -188,6 +189,7 @@ def default_live_state():
         "active_positions":[],
         "journal":[],
         "cooldowns": {},
+        "pending_exits": {},
         "last_cycle_at": None,
     }
 
@@ -310,6 +312,29 @@ class PolymarketExecutionClient:
         except Exception:
             return[]
 
+    def get_order_book(self, token_id):
+        try:
+            return self.client.get_order_book(str(token_id))
+        except Exception as error:
+            log(f"Failed to load order book for {token_id}: {error}", level="WARNING")
+            return None
+
+    def get_market_execution_price(self, token_id, side, amount):
+        try:
+            price = self.client.calculate_market_price(
+                token_id=str(token_id),
+                side=side,
+                amount=float(amount),
+                order_type=OrderType.FAK,
+            )
+            return safe_float(price, default=None)
+        except Exception as error:
+            log(
+                f"Failed to calculate market execution price for {token_id} {side} {amount}: {error}",
+                level="WARNING",
+            )
+            return None
+
     def get_balance_allowance(self):
         try:
             result = self.client.get_balance_allowance(
@@ -361,10 +386,10 @@ class PolymarketExecutionClient:
                     token_id=str(token_id), 
                     amount=float(usdc_amount), 
                     side=Side.BUY, 
-                    order_type=OrderType.FOK,
+                    order_type=OrderType.FAK,
                 ),
                 options=PartialCreateOrderOptions(tick_size=str(tick_size)),
-                order_type=OrderType.FOK
+                order_type=OrderType.FAK
             )
             return response
         except Exception as e:
@@ -377,10 +402,10 @@ class PolymarketExecutionClient:
                     token_id=str(token_id),
                     amount=float(shares),
                     side=Side.SELL,
-                    order_type=OrderType.FOK,
+                    order_type=OrderType.FAK,
                 ),
                 options=PartialCreateOrderOptions(tick_size=str(tick_size)),
-                order_type=OrderType.FOK,
+                order_type=OrderType.FAK,
             )
             return response
         except Exception as e:
@@ -517,6 +542,171 @@ def cleanup_cooldowns(state):
         for market_id, ts in state.get("cooldowns", {}).items()
         if ts > now_ts
     }
+
+def get_active_position(state, asset_id):
+    asset_id = str(asset_id)
+    for position in state.get("active_positions", []):
+        if str(position.get("asset_id")) == asset_id:
+            return position
+    return None
+
+def has_pending_exit(state, token_id=None, market_id=None):
+    pending_exits = state.get("pending_exits", {})
+    for pending in pending_exits.values():
+        if token_id is not None and str(pending.get("asset_id")) == str(token_id):
+            return True
+        if market_id is not None and str(pending.get("market_id") or "") == str(market_id):
+            return True
+    return False
+
+def queue_pending_exit(state, position, reason, journal_action, sell_price):
+    asset_id = str(position.get("asset_id"))
+    pending_exits = state.setdefault("pending_exits", {})
+    pending = pending_exits.get(asset_id)
+    if pending:
+        return pending
+
+    pending = {
+        "asset_id": asset_id,
+        "market_id": position.get("market_id"),
+        "question": position.get("question"),
+        "outcome": position.get("outcome"),
+        "reason": reason,
+        "journal_action": journal_action,
+        "sell_price": sell_price,
+        "first_detected_at": datetime.now(timezone.utc).isoformat(),
+        "last_attempt_ts": 0.0,
+        "attempts": 0,
+        "last_known_shares": safe_float(position.get("shares")),
+        "completion_recorded": False,
+    }
+    pending_exits[asset_id] = pending
+    save_json(LIVE_STATE_FILE, state)
+    return pending
+
+def finalize_completed_pending_exits(state):
+    pending_exits = state.setdefault("pending_exits", {})
+    active_asset_ids = {str(position.get("asset_id")) for position in state.get("active_positions", [])}
+
+    for asset_id in list(pending_exits.keys()):
+        pending = pending_exits[asset_id]
+        if asset_id in active_asset_ids:
+            continue
+
+        if not pending.get("completion_recorded"):
+            journal_entry(
+                state,
+                pending.get("journal_action", "SELL_COMPLETED"),
+                {
+                    "asset_id": asset_id,
+                    "question": pending.get("question"),
+                    "outcome": pending.get("outcome"),
+                    "sell_price": pending.get("sell_price"),
+                    "reason": pending.get("reason"),
+                    "attempts": pending.get("attempts", 0),
+                    "completed_via": "pending_exit",
+                },
+            )
+            pending["completion_recorded"] = True
+            log(
+                f"✅ EXIT COMPLETED after {pending.get('attempts', 0)} attempt(s)\n"
+                f"Market: <i>{str(pending.get('question', 'Unknown market'))[:80]}</i>",
+                tg=True,
+            )
+
+        pending_exits.pop(asset_id, None)
+
+    save_json(LIVE_STATE_FILE, state)
+
+def attempt_pending_exits(execution_client, state, force_asset_id=None):
+    pending_exits = state.get("pending_exits", {})
+    if not pending_exits:
+        return False
+
+    now_ts = time.time()
+    did_trade = False
+    asset_ids = [str(force_asset_id)] if force_asset_id else list(pending_exits.keys())
+
+    for asset_id in asset_ids:
+        pending = pending_exits.get(str(asset_id))
+        if not pending:
+            continue
+
+        if not force_asset_id and now_ts - safe_float(pending.get("last_attempt_ts")) < EXIT_RETRY_SECONDS:
+            continue
+
+        position = get_active_position(state, asset_id)
+        if not position:
+            continue
+
+        shares = safe_float(position.get("shares"))
+        if shares <= 0:
+            continue
+
+        sell_price = round_price_to_tick(
+            safe_float(position.get("current_price", position.get("avg_price", 0.0))),
+            position.get("tick_size", "0.01"),
+        )
+        pending["sell_price"] = sell_price
+        pending["last_known_shares"] = shares
+        pending["last_attempt_ts"] = now_ts
+        pending["attempts"] = int(pending.get("attempts", 0)) + 1
+
+        try:
+            response = execution_client.place_market_sell(
+                token_id=position["asset_id"],
+                shares=shares,
+                tick_size=position.get("tick_size", "0.01"),
+            )
+            pending["last_response"] = str(response)
+            state["pending_exits"][str(asset_id)] = pending
+            journal_entry(
+                state,
+                "SELL_ATTEMPT",
+                {
+                    "asset_id": position["asset_id"],
+                    "question": position.get("question"),
+                    "outcome": position.get("outcome"),
+                    "shares": shares,
+                    "sell_price": sell_price,
+                    "reason": pending.get("reason"),
+                    "attempt_number": pending["attempts"],
+                    "response": response,
+                },
+            )
+
+            if pending["attempts"] == 1:
+                msg = f"{pending['reason']}\nMarket: <i>{position.get('question', 'Unknown market')[:80]}</i>"
+            else:
+                msg = (
+                    f"🔁 EXIT RETRY #{pending['attempts']} @ ${sell_price:.3f}\n"
+                    f"Shares left: {shares:.4f}\n"
+                    f"Market: <i>{position.get('question', 'Unknown market')[:80]}</i>"
+                )
+            log(msg, tg=True)
+            did_trade = True
+        except Exception as error:
+            pending["last_error"] = str(error)
+            state["pending_exits"][str(asset_id)] = pending
+            journal_entry(
+                state,
+                "SELL_ATTEMPT_FAILED",
+                {
+                    "asset_id": position["asset_id"],
+                    "question": position.get("question"),
+                    "outcome": position.get("outcome"),
+                    "shares": shares,
+                    "sell_price": sell_price,
+                    "reason": pending.get("reason"),
+                    "attempt_number": pending["attempts"],
+                    "error": str(error),
+                },
+            )
+            log(f"{pending['reason']} failed: {error}", level="ERROR", tg=True)
+
+        save_json(LIVE_STATE_FILE, state)
+
+    return did_trade
 
 def reconcile_exchange_state(state, sync_snapshot):
     exchange_positions = sync_snapshot.get("exchange_positions",[])
@@ -723,10 +913,34 @@ def attempt_entries(execution_client, state, sync_snapshot):
             continue
         if has_open_position(state, candidate["token_id"]):
             continue
+        if has_pending_exit(state, token_id=candidate["token_id"], market_id=candidate["market_id"]):
+            continue
         if has_open_order(sync_snapshot, candidate["token_id"]):
             continue
 
         try:
+            entry_price = execution_client.get_market_execution_price(
+                token_id=candidate["token_id"],
+                side=Side.BUY,
+                amount=BET_AMOUNT,
+            )
+            if entry_price is None or entry_price <= 0:
+                continue
+            if entry_price > MAX_PRICE:
+                log(
+                    f"Skipping entry: order book ask-implied price ${entry_price:.3f} is above MAX_PRICE "
+                    f"${MAX_PRICE:.3f} | {candidate['question'][:60]}"
+                )
+                continue
+
+            max_recent_price = candidate["max_recent_price"]
+            target_price = entry_price + ((max_recent_price - entry_price) * RECOVERY_TARGET_PERCENT)
+            if target_price <= entry_price:
+                continue
+            expected_profit_pct = ((target_price - entry_price) / entry_price) * 100.0
+            if expected_profit_pct < MIN_PROFIT_PERCENT * 100.0:
+                continue
+
             response = execution_client.place_market_buy(
                 token_id=candidate["token_id"],
                 usdc_amount=BET_AMOUNT,
@@ -741,16 +955,16 @@ def attempt_entries(execution_client, state, sync_snapshot):
                     "question": candidate["question"],
                     "outcome": candidate["outcome"],
                     "token_id": candidate["token_id"],
-                    "current_price": candidate["current_price"],
-                    "target_price": candidate["target_price"],
+                    "current_price": entry_price,
+                    "target_price": target_price,
                     "response": response,
                 },
             )
             # Отправляем сообщение в Telegram всем админам (tg=True)
             msg = (
                 f"📉 <b>LIVE BUY submitted</b>\n"
-                f"Outcome: {candidate['outcome']} @ ~${candidate['current_price']:.3f}\n"
-                f"Target TP: ${candidate['target_price']:.3f} (+{candidate['expected_profit_pct']:.1f}%)\n"
+                f"Outcome: {candidate['outcome']} @ ~${entry_price:.3f}\n"
+                f"Target TP: ${target_price:.3f} (+{expected_profit_pct:.1f}%)\n"
                 f"Market: <i>{candidate['question'][:80]}</i>"
             )
             log(msg, tg=True)
@@ -765,7 +979,7 @@ def attempt_entries(execution_client, state, sync_snapshot):
                     position["question"] = candidate["question"]
                     position["outcome"] = candidate["outcome"]
                     position["outcome_index"] = candidate["outcome_index"]
-                    position["target_price"] = candidate["target_price"]
+                    position["target_price"] = target_price
                     position["max_recent_price"] = candidate["max_recent_price"]
                     position["tick_size"] = candidate["tick_size"]
                     position["end_date"] = candidate["end_date"]
@@ -781,43 +995,29 @@ def attempt_entries(execution_client, state, sync_snapshot):
     return did_trade
 
 def close_position(execution_client, state, position, reason, sell_price, journal_action):
-    try:
-        response = execution_client.place_market_sell(
-            token_id=position["asset_id"],
-            shares=position["shares"],
-            tick_size=position.get("tick_size", "0.01")
-        )
-        journal_entry(
-            state,
-            journal_action,
-            {
-                "asset_id": position["asset_id"],
-                "question": position.get("question"),
-                "outcome": position.get("outcome"),
-                "shares": position.get("shares"),
-                "sell_price": sell_price,
-                "reason": reason,
-                "response": response,
-            },
-        )
-        # Отправляем сообщение о продаже всем админам
-        msg = f"{reason}\nMarket: <i>{position.get('question', 'Unknown market')[:80]}</i>"
-        log(msg, tg=True)
-        save_json(LIVE_STATE_FILE, state)
-        return True
-    except Exception as error:
-        journal_entry(state, f"{journal_action}_FAILED", {"asset_id": position["asset_id"], "reason": reason, "error": str(error)})
-        log(f"{reason} failed: {error}", level="ERROR", tg=True)
-        save_json(LIVE_STATE_FILE, state)
-        return False
+    queue_pending_exit(state, position, reason, journal_action, sell_price)
+    return attempt_pending_exits(execution_client, state, force_asset_id=position["asset_id"])
 
 def attempt_exits(execution_client, state):
     did_trade = False
     now = datetime.now(timezone.utc)
 
     for position in state.get("active_positions",[]):
+        if has_pending_exit(state, token_id=position.get("asset_id")):
+            continue
+
         avg_price = float(position.get("avg_price", 0.0) or 0.0)
-        current_price = float(position.get("current_price", avg_price) or avg_price)
+        shares = safe_float(position.get("shares"))
+        executable_sell_price = execution_client.get_market_execution_price(
+            token_id=position["asset_id"],
+            side=Side.SELL,
+            amount=shares,
+        )
+        current_price = float(
+            executable_sell_price
+            if executable_sell_price is not None and executable_sell_price > 0
+            else position.get("current_price", avg_price) or avg_price
+        )
         target_price = float(position.get("target_price", avg_price * (1.0 + MIN_PROFIT_PERCENT)))
         tick_size = position.get("tick_size", "0.01")
         opened_at_raw = position.get("opened_at")
@@ -889,22 +1089,29 @@ def main():
             try:
                 cleanup_cooldowns(state)
                 sync_snapshot = sync_exchange(execution_client, state)
+                finalize_completed_pending_exits(state)
                 update_telegram_runtime_state(state, sync_snapshot)
+                if attempt_pending_exits(execution_client, state):
+                    sync_snapshot = sync_exchange(execution_client, state)
+                    finalize_completed_pending_exits(state)
+                    update_telegram_runtime_state(state, sync_snapshot)
                 attempt_exits(execution_client, state)
                 sync_snapshot = sync_exchange(execution_client, state)
+                finalize_completed_pending_exits(state)
                 update_telegram_runtime_state(state, sync_snapshot)
                 attempt_entries(execution_client, state, sync_snapshot)
                 state["last_cycle_at"] = datetime.now(timezone.utc).isoformat()
                 save_json(LIVE_STATE_FILE, state)
                 update_telegram_runtime_state(state, sync_snapshot)
-                time.sleep(CHECK_INTERVAL_SECONDS)
+                sleep_seconds = EXIT_RETRY_SECONDS if state.get("pending_exits") else CHECK_INTERVAL_SECONDS
+                time.sleep(sleep_seconds)
             except requests.exceptions.RequestException as error:
                 log(f"Network error: {error}", level="WARNING")
-                time.sleep(CHECK_INTERVAL_SECONDS)
+                time.sleep(EXIT_RETRY_SECONDS if state.get("pending_exits") else CHECK_INTERVAL_SECONDS)
             except Exception:
                 err_trace = traceback.format_exc()
                 log(f"Cycle failure:\n{err_trace}", level="ERROR", tg=True)
-                time.sleep(CHECK_INTERVAL_SECONDS)
+                time.sleep(EXIT_RETRY_SECONDS if state.get("pending_exits") else CHECK_INTERVAL_SECONDS)
     except KeyboardInterrupt:
         log("Live swing service stopped by user.", tg=True)
 
