@@ -40,7 +40,7 @@ COOLDOWN_HOURS = 4.0
 MIN_LIQUIDITY = 5000.0
 MIN_VOLUME = 20000.0
 MIN_DAYS_TO_EXPIRY = 2.0
-CHECK_INTERVAL_SECONDS = 60
+CHECK_INTERVAL_SECONDS = 30
 
 ENV_FILE = ".env"
 GAMMA_API_URL = "https://gamma-api.polymarket.com/events"
@@ -49,6 +49,7 @@ DATA_API_URL = "https://data-api.polymarket.com"
 LIVE_STATE_FILE = "satt_live_state.json"
 LIVE_SYNC_FILE = "satt_live_sync.json"
 LIVE_HISTORY_FILE = "satt_live_price_history.json"
+USDC_DECIMALS = 1_000_000
 
 http_session = requests.Session()
 http_session.headers.update(
@@ -95,6 +96,15 @@ def load_json(path, default):
 def save_json(path, data):
     with open(path, "w", encoding="utf-8") as file:
         json.dump(data, file, indent=4, ensure_ascii=False)
+
+def safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+def micro_to_usdc(value):
+    return safe_float(value) / USDC_DECIMALS
 
 def parse_token_ids(market):
     raw = market.get("clobTokenIds", "[]")
@@ -240,6 +250,7 @@ class PolymarketExecutionClient:
                     token_id=str(token_id), 
                     amount=float(usdc_amount), 
                     side=Side.BUY, 
+                    order_type=OrderType.FOK,
                 ),
                 options=PartialCreateOrderOptions(tick_size=str(tick_size)),
                 order_type=OrderType.FOK
@@ -248,17 +259,17 @@ class PolymarketExecutionClient:
         except Exception as e:
             raise e
 
-    def place_limit_sell(self, token_id, shares, price, tick_size="0.01"):
+    def place_market_sell(self, token_id, shares, tick_size="0.01"):
         try:
-            response = self.client.create_and_post_order(
-                order_args=OrderArgs(
+            response = self.client.create_and_post_market_order(
+                order_args=MarketOrderArgs(
                     token_id=str(token_id),
-                    price=float(price),
-                    size=float(shares),
+                    amount=float(shares),
                     side=Side.SELL,
+                    order_type=OrderType.FOK,
                 ),
                 options=PartialCreateOrderOptions(tick_size=str(tick_size)),
-                order_type=OrderType.GTC,
+                order_type=OrderType.FOK,
             )
             return response
         except Exception as e:
@@ -449,25 +460,43 @@ def journal_entry(state, action, payload):
     )
     state["journal"] = state["journal"][-500:]
 
+def get_positions_current_value(positions):
+    total = 0.0
+    for position in positions or []:
+        total += safe_float(position.get("currentValue"))
+    return total
+
 def sync_exchange(execution_client, state):
     open_orders = execution_client.get_open_orders()
     positions = execution_client.get_positions()
-    portfolio_value = execution_client.get_total_value()
+    portfolio_value_api = execution_client.get_total_value()
     balance_allowance = execution_client.get_balance_allowance()
     
     available_balance = None
     if balance_allowance:
         try:
-            balance_raw = float(balance_allowance.get("balance", 0.0))
-            available_balance = balance_raw / 1_000_000.0
+            balance_raw = balance_allowance.get("balance", 0.0)
+            available_balance = micro_to_usdc(balance_raw)
         except Exception:
             available_balance = None
+
+    positions_current_value = get_positions_current_value(positions)
+    portfolio_value_dynamic = None
+    if available_balance is not None:
+        portfolio_value_dynamic = available_balance + positions_current_value
+
+    portfolio_value = portfolio_value_dynamic
+    if portfolio_value is None:
+        portfolio_value = portfolio_value_api
 
     sync_snapshot = {
         "last_sync_at": datetime.now(timezone.utc).isoformat(),
         "open_orders": open_orders,
         "exchange_positions": positions,
         "portfolio_value": portfolio_value,
+        "portfolio_value_api": portfolio_value_api,
+        "portfolio_value_dynamic": portfolio_value_dynamic,
+        "positions_current_value": positions_current_value,
         "balance_allowance": balance_allowance,
         "available_balance": available_balance,
         "derived_api_creds": None,
@@ -581,10 +610,9 @@ def attempt_entries(execution_client, state, sync_snapshot):
 
 def close_position(execution_client, state, position, reason, sell_price, journal_action):
     try:
-        response = execution_client.place_limit_sell(
+        response = execution_client.place_market_sell(
             token_id=position["asset_id"],
             shares=position["shares"],
-            price=sell_price,
             tick_size=position.get("tick_size", "0.01")
         )
         journal_entry(
