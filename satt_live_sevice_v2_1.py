@@ -484,7 +484,7 @@ class PolymarketExecutionClient:
                     signature_type=self.signature_type,
                 )
             )
-            return safe_float((result or {}).get("balance"), default=0.0)
+            return micro_to_usdc((result or {}).get("balance"))
         except Exception as error:
             log(f"Failed to load conditional balance for {token_id}: {error}", level="WARNING")
             return None
@@ -1508,10 +1508,10 @@ def attempt_entries(execution_client, state, sync_snapshot):
             stats["balance_err"] += 1
             log(f"Skipping entry for {candidate['token_id']}: unable to verify token balance.", level="WARNING")
             continue
-        if token_balance > 0:
+        if token_balance > 0.001:
             stats["has_balance"] += 1
             log(
-                f"Blocking BUY for token {candidate['token_id']}: on-chain/API balance is {token_balance}.",
+                f"Blocking BUY for token {candidate['token_id']}: on-chain/API balance is {token_balance:.4f}.",
                 level="INFO",
             )
             continue
