@@ -53,6 +53,7 @@ MIN_DAYS_TO_EXPIRY = 2.0
 CHECK_INTERVAL_SECONDS = 30
 EXIT_RETRY_SECONDS = 10
 ENTRY_WINDOW_MINUTES = 10
+BUY_COOLDOWN_MINUTES = 15
 TX_CONFIRM_TIMEOUT_SECONDS = 90
 LIMIT_ORDER_RETRY_COUNT = 3
 LIMIT_ORDER_RETRY_DELAY_SECONDS = 3
@@ -1446,6 +1447,19 @@ def has_open_order(sync_snapshot, token_id):
             return True
     return False
 
+def has_recent_buy(state, token_id, minutes=BUY_COOLDOWN_MINUTES):
+    token_id = str(token_id)
+    cutoff = utc_now() - timedelta(minutes=minutes)
+    for entry in reversed(state.get("journal", [])):
+        if str(entry.get("action")) == "BUY_SUBMITTED":
+            payload = entry.get("payload", {})
+            if str(payload.get("token_id")) == token_id:
+                ts = parse_datetime(entry.get("ts"))
+                if ts and ts > cutoff:
+                    return True
+                return False
+    return False
+
 def attempt_entries(execution_client, state, sync_snapshot):
     if transaction_in_flight(state):
         log("Skipping entries: previous transaction is still awaiting confirmation.", level="WARNING")
@@ -1495,6 +1509,9 @@ def attempt_entries(execution_client, state, sync_snapshot):
             stats["banned"] += 1
             continue
         if has_open_position(state, candidate["token_id"]):
+            stats["has_position"] += 1
+            continue
+        if has_recent_buy(state, candidate["token_id"]):
             stats["has_position"] += 1
             continue
         if has_pending_exit(state, token_id=candidate["token_id"], market_id=candidate["market_id"]):
