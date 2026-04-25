@@ -581,14 +581,17 @@ def maintain_price_history(valid_events):
     history = load_json(LIVE_HISTORY_FILE, {})
     now_ts = int(time.time())
     cutoff_ts = now_ts - int(HISTORY_WINDOW_HOURS * 3600)
-    candidates =[]
+    candidates = []
+    stats = {"events": 0, "markets": 0, "outcomes": 0, "too_few_history": 0, "price_out_of_range": 0, "no_drop": 0, "no_profit": 0, "candidates": 0}
 
     for event in valid_events:
-        for market in event.get("markets",[]):
+        stats["events"] += 1
+        for market in event.get("markets", []):
+            stats["markets"] += 1
             if market.get("closed"):
                 continue
 
-            outcomes = market.get("outcomes",[])
+            outcomes = market.get("outcomes", [])
             prices = parse_outcome_prices(market)
             token_ids = parse_token_ids(market)
             if len(prices) != len(token_ids):
@@ -598,13 +601,18 @@ def maintain_price_history(valid_events):
             market_history = history.setdefault(market_id, {})
 
             for outcome_index, price in enumerate(prices):
+                stats["outcomes"] += 1
                 outcome_key = str(outcome_index)
-                outcome_history = market_history.setdefault(outcome_key,[])
-                outcome_history =[record for record in outcome_history if record[0] >= cutoff_ts]
+                outcome_history = market_history.setdefault(outcome_key, [])
+                outcome_history = [record for record in outcome_history if record[0] >= cutoff_ts]
                 outcome_history.append((now_ts, price))
                 market_history[outcome_key] = outcome_history
 
-                if len(outcome_history) < 2 or not (MIN_PRICE <= price <= MAX_PRICE):
+                if len(outcome_history) < 2:
+                    stats["too_few_history"] += 1
+                    continue
+                if not (MIN_PRICE <= price <= MAX_PRICE):
+                    stats["price_out_of_range"] += 1
                     continue
 
                 max_recent_price = max(record[1] for record in outcome_history)
@@ -613,14 +621,17 @@ def maintain_price_history(valid_events):
 
                 drop_ratio = (max_recent_price - price) / max_recent_price
                 if drop_ratio < DROP_PERCENT_REQUIRED:
+                    stats["no_drop"] += 1
                     continue
 
                 target_price = price + ((max_recent_price - price) * RECOVERY_TARGET_PERCENT)
                 expected_profit_pct = (target_price - price) / price
                 if expected_profit_pct < MIN_PROFIT_PERCENT:
+                    stats["no_profit"] += 1
                     continue
 
                 score = float(market.get("volume", 0)) + float(market.get("liquidity", 0))
+                stats["candidates"] += 1
                 candidates.append(
                     {
                         "score": score,
@@ -641,12 +652,27 @@ def maintain_price_history(valid_events):
                 )
 
     save_json(LIVE_HISTORY_FILE, history)
+    log(
+        f"[maintain_price_history] events={stats['events']} markets={stats['markets']} outcomes={stats['outcomes']} "
+        f"too_few_hist={stats['too_few_history']} price_range={stats['price_out_of_range']} no_drop={stats['no_drop']} "
+        f"no_profit={stats['no_profit']} candidates={stats['candidates']}"
+    )
     return candidates
 
 def collect_valid_events():
-    valid_events =[]
+    valid_events = []
     limit = 100
     offset = 0
+    stats = {
+        "total_events": 0,
+        "no_end_date": 0,
+        "expired": 0,
+        "too_soon": 0,
+        "low_volume": 0,
+        "no_eligible_markets": 0,
+        "accepted": 0,
+        "eligible_markets": 0,
+    }
 
     while offset < 500:
         response = http_session.get(
@@ -666,21 +692,26 @@ def collect_valid_events():
             break
 
         for event in payload:
+            stats["total_events"] += 1
             end_date_str = event.get("endDate")
             if not end_date_str:
+                stats["no_end_date"] += 1
                 continue
 
             seconds_left = seconds_until_expiry(end_date_str)
             if seconds_left is None or seconds_left <= 0:
+                stats["expired"] += 1
                 continue
             if seconds_left < MIN_DAYS_TO_EXPIRY * 24 * 3600:
+                stats["too_soon"] += 1
                 continue
             if float(event.get("volume", 0)) < MIN_VOLUME:
+                stats["low_volume"] += 1
                 continue
             event["is_sports_market"] = event_is_sports(event)
 
-            eligible_markets =[]
-            for market in event.get("markets",[]):
+            eligible_markets = []
+            for market in event.get("markets", []):
                 if market.get("closed"):
                     continue
                 if float(market.get("liquidity", 0)) < MIN_LIQUIDITY:
@@ -692,10 +723,19 @@ def collect_valid_events():
             if eligible_markets:
                 event["markets"] = eligible_markets
                 valid_events.append(event)
+                stats["accepted"] += 1
+                stats["eligible_markets"] += len(eligible_markets)
+            else:
+                stats["no_eligible_markets"] += 1
 
         offset += limit
         time.sleep(0.2)
 
+    log(
+        f"[collect_valid_events] total={stats['total_events']} accepted={stats['accepted']} "
+        f"no_end_date={stats['no_end_date']} expired={stats['expired']} too_soon={stats['too_soon']} "
+        f"low_volume={stats['low_volume']} no_markets={stats['no_eligible_markets']} markets={stats['eligible_markets']}"
+    )
     return valid_events
 
 def cleanup_cooldowns(state):
@@ -1428,26 +1468,48 @@ def attempt_entries(execution_client, state, sync_snapshot):
 
     candidates.sort(key=lambda item: item["score"], reverse=True)
     did_trade = False
+    stats = {
+        "total": len(candidates),
+        "too_soon": 0,
+        "cooldown": 0,
+        "banned": 0,
+        "has_position": 0,
+        "pending_exit": 0,
+        "has_order": 0,
+        "balance_err": 0,
+        "has_balance": 0,
+        "entry_price_err": 0,
+        "entry_price_high": 0,
+        "no_profit": 0,
+    }
 
     for candidate in candidates:
         seconds_left = seconds_until_expiry(candidate.get("end_date"))
         if seconds_left is None or seconds_left <= 0 or seconds_left < MIN_DAYS_TO_EXPIRY * 24 * 3600:
+            stats["too_soon"] += 1
             continue
         if position_is_in_cooldown(state, candidate["market_id"]):
+            stats["cooldown"] += 1
             continue
         if is_market_banned(state, candidate["market_id"]):
+            stats["banned"] += 1
             continue
         if has_open_position(state, candidate["token_id"]):
+            stats["has_position"] += 1
             continue
         if has_pending_exit(state, token_id=candidate["token_id"], market_id=candidate["market_id"]):
+            stats["pending_exit"] += 1
             continue
         if has_open_order(sync_snapshot, candidate["token_id"]):
+            stats["has_order"] += 1
             continue
         token_balance = execution_client.get_token_balance(candidate["token_id"])
         if token_balance is None:
+            stats["balance_err"] += 1
             log(f"Skipping entry for {candidate['token_id']}: unable to verify token balance.", level="WARNING")
             continue
         if token_balance > 0:
+            stats["has_balance"] += 1
             log(
                 f"Blocking BUY for token {candidate['token_id']}: on-chain/API balance is {token_balance}.",
                 level="INFO",
@@ -1466,8 +1528,10 @@ def attempt_entries(execution_client, state, sync_snapshot):
                 amount=BET_AMOUNT,
             )
             if entry_price is None or entry_price <= 0:
+                stats["entry_price_err"] += 1
                 continue
             if entry_price > MAX_PRICE:
+                stats["entry_price_high"] += 1
                 log(
                     f"Skipping entry: order book ask-implied price ${entry_price:.3f} is above MAX_PRICE "
                     f"${MAX_PRICE:.3f} | {candidate['question'][:60]}"
@@ -1477,9 +1541,11 @@ def attempt_entries(execution_client, state, sync_snapshot):
             max_recent_price = candidate["max_recent_price"]
             target_price = entry_price + ((max_recent_price - entry_price) * RECOVERY_TARGET_PERCENT)
             if target_price <= entry_price:
+                stats["no_profit"] += 1
                 continue
             expected_profit_pct = ((target_price - entry_price) / entry_price) * 100.0
             if expected_profit_pct < MIN_PROFIT_PERCENT * 100.0:
+                stats["no_profit"] += 1
                 continue
 
             begin_transaction(
@@ -1560,6 +1626,13 @@ def attempt_entries(execution_client, state, sync_snapshot):
             if execution_lock.locked():
                 execution_lock.release()
 
+    log(
+        f"[attempt_entries] total_candidates={stats['total']} too_soon={stats['too_soon']} "
+        f"cooldown={stats['cooldown']} banned={stats['banned']} has_position={stats['has_position']} "
+        f"pending_exit={stats['pending_exit']} has_order={stats['has_order']} balance_err={stats['balance_err']} "
+        f"has_balance={stats['has_balance']} entry_price_err={stats['entry_price_err']} entry_price_high={stats['entry_price_high']} "
+        f"no_profit={stats['no_profit']}"
+    )
     return did_trade
 
 def close_position(execution_client, state, position, reason, sell_price, journal_action, sync_snapshot=None):
