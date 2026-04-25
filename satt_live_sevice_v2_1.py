@@ -21,7 +21,8 @@ from py_clob_client_v2 import (
     PartialCreateOrderOptions,
     Side
 )
-from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
+from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams, OrderPayload
+from py_clob_client_v2.exceptions import PolyApiException
 
 # Загружаем переменные окружения здесь, чтобы были доступны токены Telegram
 load_dotenv(".env")
@@ -32,6 +33,7 @@ TELEGRAM_ADMIN_IDS = os.getenv("TELEGRAM_ADMIN_IDS", "").strip()
 TELEGRAM_MENU_BUTTON_STATS = "Статистика"
 STRATEGY_DISPLAY_NAME = os.getenv("STRATEGY_DISPLAY_NAME", "Balanced Log Flow v1").strip() or "Balanced Log Flow v1"
 STARTING_BALANCE = float(os.getenv("STARTING_BALANCE", "100"))
+TELEGRAM_MENU_BUTTON_STOP = "stop"
 
 # --- Strategy settings ---
 BET_AMOUNT = 2.5
@@ -44,11 +46,17 @@ MIN_PROFIT_PERCENT = 0.15
 STOP_LOSS_MULTIPLIER = 0.50
 MAX_HOLD_HOURS = 24.0
 COOLDOWN_HOURS = 4.0
+MARKET_BAN_HOURS = 4.0
 MIN_LIQUIDITY = 5000.0
 MIN_VOLUME = 20000.0
 MIN_DAYS_TO_EXPIRY = 2.0
 CHECK_INTERVAL_SECONDS = 30
 EXIT_RETRY_SECONDS = 10
+ENTRY_WINDOW_MINUTES = 10
+TX_CONFIRM_TIMEOUT_SECONDS = 90
+LIMIT_ORDER_RETRY_COUNT = 3
+LIMIT_ORDER_RETRY_DELAY_SECONDS = 3
+LIMIT_ORDER_EXPIRY_BUFFER_SECONDS = 300
 
 ENV_FILE = ".env"
 GAMMA_API_URL = "https://gamma-api.polymarket.com/events"
@@ -70,6 +78,10 @@ http_session.headers.update(
 telegram_state_lock = threading.Lock()
 telegram_shared_state = None
 telegram_shared_snapshot = {}
+execution_lock = threading.Lock()
+service_stop_event = threading.Event()
+event_sports_cache = {}
+sports_tag_ids_cache = None
 
 def send_telegram_message(text):
     """Функция для отправки уведомлений списку администраторов в Telegram"""
@@ -189,9 +201,119 @@ def default_live_state():
         "active_positions":[],
         "journal":[],
         "cooldowns": {},
+        "market_bans": {},
         "pending_exits": {},
+        "limit_orders": {},
+        "transaction": None,
+        "recovery": {
+            "last_started_at": None,
+            "last_completed_at": None,
+            "last_status": None,
+        },
         "last_cycle_at": None,
     }
+
+def ensure_live_state_schema(state):
+    base = default_live_state()
+    for key, value in base.items():
+        if key not in state:
+            state[key] = value
+    if not isinstance(state.get("cooldowns"), dict):
+        state["cooldowns"] = {}
+    if not isinstance(state.get("market_bans"), dict):
+        state["market_bans"] = {}
+    if not isinstance(state.get("pending_exits"), dict):
+        state["pending_exits"] = {}
+    if not isinstance(state.get("limit_orders"), dict):
+        state["limit_orders"] = {}
+    if not isinstance(state.get("journal"), list):
+        state["journal"] = []
+    if not isinstance(state.get("active_positions"), list):
+        state["active_positions"] = []
+    if not isinstance(state.get("recovery"), dict):
+        state["recovery"] = base["recovery"]
+    return state
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+def parse_datetime(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+def seconds_until_expiry(end_date):
+    parsed = parse_datetime(end_date)
+    if parsed is None:
+        return None
+    return (parsed - utc_now()).total_seconds()
+
+def normalize_text(value):
+    return str(value or "").strip().lower()
+
+def get_sports_tag_ids():
+    global sports_tag_ids_cache
+    if sports_tag_ids_cache is not None:
+        return sports_tag_ids_cache
+
+    sports_tag_ids = set()
+    try:
+        response = http_session.get(f"{GAMMA_API_URL.rsplit('/', 1)[0]}/sports", timeout=20)
+        response.raise_for_status()
+        payload = response.json() or []
+        for item in payload:
+            raw_tags = str(item.get("tags") or "")
+            for tag_id in raw_tags.split(","):
+                tag_id = tag_id.strip()
+                if tag_id:
+                    sports_tag_ids.add(tag_id)
+    except Exception as error:
+        log(f"Failed to load sports tag metadata: {error}", level="WARNING")
+
+    sports_tag_ids_cache = sports_tag_ids
+    return sports_tag_ids_cache
+
+def event_is_sports(event):
+    event_id = str(event.get("id") or "")
+    if event_id in event_sports_cache:
+        return event_sports_cache[event_id]
+
+    category = normalize_text(event.get("category"))
+    subcategory = normalize_text(event.get("subcategory"))
+    if category == "sports" or subcategory == "sports":
+        event_sports_cache[event_id] = True
+        return True
+
+    sports_tag_ids = get_sports_tag_ids()
+    if sports_tag_ids and event_id:
+        try:
+            response = http_session.get(
+                f"{GAMMA_API_URL.rsplit('/', 1)[0]}/events/{event_id}/tags",
+                timeout=20,
+            )
+            response.raise_for_status()
+            tags = response.json() or []
+            for tag in tags:
+                tag_id = str(tag.get("id") or "").strip()
+                slug = normalize_text(tag.get("slug"))
+                label = normalize_text(tag.get("label"))
+                if tag_id in sports_tag_ids or slug == "sports" or label == "sports":
+                    event_sports_cache[event_id] = True
+                    return True
+        except Exception as error:
+            log(f"Failed to load tags for event {event_id}: {error}", level="WARNING")
+
+    event_sports_cache[event_id] = False
+    return False
+
+def position_is_sports(position):
+    return bool(position.get("is_sports_market"))
 
 def update_telegram_runtime_state(state, sync_snapshot):
     global telegram_shared_state, telegram_shared_snapshot
@@ -222,6 +344,12 @@ async def telegram_stats_handler(update: Update, context: ContextTypes.DEFAULT_T
     state, sync_snapshot = get_telegram_runtime_state()
     await update.effective_chat.send_message(format_statistics_message(state, sync_snapshot))
 
+async def telegram_stop_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or not is_telegram_admin(update.effective_chat.id):
+        return
+    service_stop_event.set()
+    await update.effective_chat.send_message("Stopping bot loop.")
+
 async def telegram_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_chat or not update.effective_message:
         return
@@ -233,6 +361,8 @@ async def telegram_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await telegram_menu_handler(update, context)
     elif text == TELEGRAM_MENU_BUTTON_STATS.lower():
         await telegram_stats_handler(update, context)
+    elif text == TELEGRAM_MENU_BUTTON_STOP.lower():
+        await telegram_stop_handler(update, context)
 
 def start_telegram_bot():
     if not TELEGRAM_BOT_TOKEN:
@@ -345,6 +475,20 @@ class PolymarketExecutionClient:
             log(f"Failed to load collateral balance/allowance: {error}", level="WARNING")
             return None
 
+    def get_token_balance(self, token_id):
+        try:
+            result = self.client.get_balance_allowance(
+                BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL,
+                    token_id=str(token_id),
+                    signature_type=self.signature_type,
+                )
+            )
+            return safe_float((result or {}).get("balance"), default=0.0)
+        except Exception as error:
+            log(f"Failed to load conditional balance for {token_id}: {error}", level="WARNING")
+            return None
+
     def get_positions(self):
         if not self.profile_address:
             return[]
@@ -411,6 +555,26 @@ class PolymarketExecutionClient:
         except Exception as e:
             raise e
 
+    def place_limit_sell(self, token_id, shares, price, tick_size="0.01", expiration=None):
+        try:
+            response = self.client.create_and_post_order(
+                order_args=OrderArgs(
+                    token_id=str(token_id),
+                    price=float(price),
+                    size=float(shares),
+                    side=Side.SELL,
+                    expiration=int(expiration or 0),
+                ),
+                options=PartialCreateOrderOptions(tick_size=str(tick_size)),
+                order_type=OrderType.GTC if not expiration else OrderType.GTD,
+            )
+            return response
+        except Exception as e:
+            raise e
+
+    def cancel_order_by_id(self, order_id):
+        return self.client.cancel_order(OrderPayload(orderID=str(order_id)))
+
 # --- ЛОГИКА СТРАТЕГИИ ---
 
 def maintain_price_history(valid_events):
@@ -472,6 +636,7 @@ def maintain_price_history(valid_events):
                         "expected_profit_pct": expected_profit_pct * 100.0,
                         "tick_size": get_tick_size(market),
                         "end_date": event.get("endDate"),
+                        "is_sports_market": bool(event.get("is_sports_market")),
                     }
                 )
 
@@ -482,7 +647,6 @@ def collect_valid_events():
     valid_events =[]
     limit = 100
     offset = 0
-    min_end_date = datetime.now(timezone.utc) + timedelta(days=MIN_DAYS_TO_EXPIRY)
 
     while offset < 500:
         response = http_session.get(
@@ -506,15 +670,14 @@ def collect_valid_events():
             if not end_date_str:
                 continue
 
-            try:
-                end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-            except Exception:
+            seconds_left = seconds_until_expiry(end_date_str)
+            if seconds_left is None or seconds_left <= 0:
                 continue
-
-            if end_date < min_end_date:
+            if seconds_left > ENTRY_WINDOW_MINUTES * 60:
                 continue
             if float(event.get("volume", 0)) < MIN_VOLUME:
                 continue
+            event["is_sports_market"] = event_is_sports(event)
 
             eligible_markets =[]
             for market in event.get("markets",[]):
@@ -536,12 +699,28 @@ def collect_valid_events():
     return valid_events
 
 def cleanup_cooldowns(state):
-    now_ts = datetime.now(timezone.utc).timestamp()
+    now_ts = utc_now().timestamp()
     state["cooldowns"] = {
         market_id: ts
         for market_id, ts in state.get("cooldowns", {}).items()
         if ts > now_ts
     }
+    state["market_bans"] = {
+        market_id: ts
+        for market_id, ts in state.get("market_bans", {}).items()
+        if ts > now_ts
+    }
+    limit_orders = {}
+    for asset_id, order in state.get("limit_orders", {}).items():
+        expires_at = parse_datetime(order.get("expires_at"))
+        if expires_at is None or expires_at > utc_now():
+            limit_orders[str(asset_id)] = order
+    state["limit_orders"] = limit_orders
+    tx = state.get("transaction")
+    if tx:
+        started_at = parse_datetime(tx.get("started_at"))
+        if started_at is None or (utc_now() - started_at).total_seconds() > TX_CONFIRM_TIMEOUT_SECONDS:
+            state["transaction"] = None
 
 def get_active_position(state, asset_id):
     asset_id = str(asset_id)
@@ -559,6 +738,100 @@ def has_pending_exit(state, token_id=None, market_id=None):
             return True
     return False
 
+def is_market_banned(state, market_id):
+    ban_until = state.get("market_bans", {}).get(str(market_id))
+    if not ban_until:
+        return False
+    return ban_until > utc_now().timestamp()
+
+def ban_market(state, market_id, hours=MARKET_BAN_HOURS):
+    if not market_id:
+        return None
+    ban_until = (utc_now() + timedelta(hours=hours)).timestamp()
+    state.setdefault("market_bans", {})[str(market_id)] = ban_until
+    return ban_until
+
+def get_limit_order(state, asset_id):
+    return state.get("limit_orders", {}).get(str(asset_id))
+
+def set_limit_order(state, asset_id, payload):
+    state.setdefault("limit_orders", {})[str(asset_id)] = payload
+
+def clear_limit_order(state, asset_id):
+    state.setdefault("limit_orders", {}).pop(str(asset_id), None)
+
+def has_limit_order(sync_snapshot, token_id):
+    token_id = str(token_id)
+    for order in sync_snapshot.get("open_orders", []):
+        asset_id = str(order.get("asset_id") or order.get("assetId") or order.get("token_id") or "")
+        side = str(order.get("side") or "").upper()
+        if asset_id == token_id and side == "SELL":
+            return True
+    return False
+
+def begin_transaction(state, action, token_id=None, market_id=None, extra=None):
+    metadata = {
+        "action": action,
+        "token_id": str(token_id) if token_id is not None else None,
+        "market_id": str(market_id) if market_id is not None else None,
+        "started_at": utc_now().isoformat(),
+        "status": "pending",
+    }
+    if extra:
+        metadata.update(extra)
+    state["transaction"] = metadata
+    save_json(LIVE_STATE_FILE, state)
+    return metadata
+
+def complete_transaction(state, status, error=None):
+    tx = state.get("transaction")
+    if tx:
+        tx["status"] = status
+        tx["finished_at"] = utc_now().isoformat()
+        if error:
+            tx["error"] = str(error)
+    if status in {"confirmed", "failed", "timed_out"}:
+        state["transaction"] = None
+    else:
+        state["transaction"] = tx
+    save_json(LIVE_STATE_FILE, state)
+
+def transaction_in_flight(state):
+    tx = state.get("transaction")
+    if not tx:
+        return False
+    started_at = parse_datetime(tx.get("started_at"))
+    if started_at is None:
+        return False
+    if (utc_now() - started_at).total_seconds() > TX_CONFIRM_TIMEOUT_SECONDS:
+        complete_transaction(state, "timed_out", error="Transaction confirmation timeout")
+        return False
+    return tx.get("status") in {"pending", "submitted"}
+
+def await_position_sync(execution_client, state, token_id, should_exist, timeout_seconds=TX_CONFIRM_TIMEOUT_SECONDS):
+    deadline = time.time() + timeout_seconds
+    last_snapshot = None
+    while time.time() < deadline:
+        last_snapshot = sync_exchange(execution_client, state)
+        position_exists = has_open_position(state, token_id)
+        if position_exists == should_exist:
+            return True, last_snapshot
+        time.sleep(3)
+    return False, last_snapshot
+
+def resolve_order_id(response):
+    if isinstance(response, dict):
+        for key in ("orderID", "id", "orderId"):
+            if response.get(key):
+                return str(response[key])
+    return None
+
+def response_has_no_orderbook(error):
+    if not isinstance(error, PolyApiException):
+        return False
+    text = str(error).lower()
+    return error.status_code == 404 or "no orderbook" in text or "no match" in text
+
 def queue_pending_exit(state, position, reason, journal_action, sell_price, sync_snapshot=None):
     asset_id = str(position.get("asset_id"))
     pending_exits = state.setdefault("pending_exits", {})
@@ -571,6 +844,7 @@ def queue_pending_exit(state, position, reason, journal_action, sell_price, sync
         "market_id": position.get("market_id"),
         "question": position.get("question"),
         "outcome": position.get("outcome"),
+        "is_sports_market": bool(position.get("is_sports_market")),
         "reason": reason,
         "journal_action": journal_action,
         "sell_price": sell_price,
@@ -601,6 +875,7 @@ def finalize_completed_pending_exits(state, sync_snapshot=None):
         if asset_id in active_asset_ids:
             continue
 
+        clear_limit_order(state, asset_id)
         if not pending.get("completion_recorded"):
             available_balance_after = (
                 safe_float(sync_snapshot.get("available_balance"), default=None)
@@ -625,6 +900,12 @@ def finalize_completed_pending_exits(state, sync_snapshot=None):
             if realized_proceeds is not None and entry_cost > 0:
                 pnl_usdc = realized_proceeds - entry_cost
                 pnl_pct = (pnl_usdc / entry_cost) * 100.0
+                if (
+                    pnl_usdc < 0
+                    and pending.get("journal_action") == "SELL_STOP_LOSS"
+                    and position_is_sports(pending)
+                ):
+                    ban_market(state, pending.get("market_id"), hours=MARKET_BAN_HOURS)
 
             journal_entry(
                 state,
@@ -647,6 +928,7 @@ def finalize_completed_pending_exits(state, sync_snapshot=None):
                 },
             )
             pending["completion_recorded"] = True
+            complete_transaction(state, "confirmed")
             summary = [
                 f"✅ EXIT COMPLETED after {pending.get('attempts', 0)} attempt(s)",
                 f"Buy: ${safe_float(pending.get('entry_price')):.3f} | Sell: ${safe_float(actual_sell_price):.3f}",
@@ -661,6 +943,9 @@ def finalize_completed_pending_exits(state, sync_snapshot=None):
     save_json(LIVE_STATE_FILE, state)
 
 def attempt_pending_exits(execution_client, state, force_asset_id=None):
+    if transaction_in_flight(state):
+        return False
+
     pending_exits = state.get("pending_exits", {})
     if not pending_exits:
         return False
@@ -694,7 +979,20 @@ def attempt_pending_exits(execution_client, state, force_asset_id=None):
         pending["last_attempt_ts"] = now_ts
         pending["attempts"] = int(pending.get("attempts", 0)) + 1
 
+        acquired = execution_lock.acquire(timeout=1)
+        if not acquired:
+            log("Skipping exit attempt: another transaction is still being processed.", level="WARNING")
+            continue
+
         try:
+            begin_transaction(
+                state,
+                "SELL",
+                token_id=position["asset_id"],
+                market_id=position.get("market_id"),
+                extra={"reason": pending.get("reason", "")[:120]},
+            )
+            cancel_tracked_limit_order(execution_client, state, asset_id)
             response = execution_client.place_market_sell(
                 token_id=position["asset_id"],
                 shares=shares,
@@ -726,6 +1024,7 @@ def attempt_pending_exits(execution_client, state, force_asset_id=None):
                     f"Market: <i>{position.get('question', 'Unknown market')[:80]}</i>"
                 )
             log(msg, tg=True)
+            complete_transaction(state, "submitted")
             did_trade = True
         except Exception as error:
             pending["last_error"] = str(error)
@@ -745,6 +1044,10 @@ def attempt_pending_exits(execution_client, state, force_asset_id=None):
                 },
             )
             log(f"{pending['reason']} failed: {error}", level="ERROR", tg=True)
+            complete_transaction(state, "failed", error=error)
+        finally:
+            if execution_lock.locked():
+                execution_lock.release()
 
         save_json(LIVE_STATE_FILE, state)
 
@@ -788,6 +1091,7 @@ def reconcile_exchange_state(state, sync_snapshot):
                 "max_recent_price": max_recent_price,
                 "tick_size": local.get("tick_size", "0.01"),
                 "end_date": local.get("end_date") or position.get("endDate"),
+                "is_sports_market": bool(local.get("is_sports_market")),
             }
         )
 
@@ -910,6 +1214,177 @@ def sync_exchange(execution_client, state):
     save_json(LIVE_STATE_FILE, state)
     return sync_snapshot
 
+def build_limit_order_payload(position, order_id, limit_price):
+    expires_at = None
+    expiry_seconds = seconds_until_expiry(position.get("end_date"))
+    expiration = 0
+    if expiry_seconds is not None:
+        expiration_dt = utc_now() + timedelta(seconds=max(30, min(expiry_seconds, LIMIT_ORDER_EXPIRY_BUFFER_SECONDS)))
+        expires_at = expiration_dt.isoformat()
+        expiration = int(expiration_dt.timestamp())
+    return {
+        "order_id": order_id,
+        "asset_id": str(position.get("asset_id")),
+        "market_id": str(position.get("market_id") or ""),
+        "price": safe_float(limit_price),
+        "shares": safe_float(position.get("shares")),
+        "placed_at": utc_now().isoformat(),
+        "expires_at": expires_at,
+        "expiration": expiration,
+    }
+
+def ensure_protective_limit_order(execution_client, state, position, sync_snapshot=None, notify_prefix=None):
+    asset_id = str(position.get("asset_id"))
+    if has_limit_order(sync_snapshot or {}, asset_id) or get_limit_order(state, asset_id):
+        return True
+
+    shares = safe_float(position.get("shares"))
+    entry_price = safe_float(position.get("avg_price", position.get("buy_price")))
+    if shares <= 0 or entry_price <= 0:
+        return False
+
+    tick_size = position.get("tick_size", "0.01")
+    limit_price = round_price_to_tick(entry_price * STOP_LOSS_MULTIPLIER, tick_size)
+    expiry_seconds = seconds_until_expiry(position.get("end_date"))
+    expiration = None
+    if expiry_seconds is not None:
+        expiration = int((utc_now() + timedelta(seconds=max(30, min(expiry_seconds, LIMIT_ORDER_EXPIRY_BUFFER_SECONDS)))).timestamp())
+
+    last_error = None
+    for attempt in range(1, LIMIT_ORDER_RETRY_COUNT + 1):
+        try:
+            response = execution_client.place_limit_sell(
+                token_id=asset_id,
+                shares=shares,
+                price=limit_price,
+                tick_size=tick_size,
+                expiration=expiration,
+            )
+            order_id = resolve_order_id(response)
+            set_limit_order(state, asset_id, build_limit_order_payload(position, order_id, limit_price))
+            journal_entry(
+                state,
+                "SELL_LIMIT_PLACED",
+                {
+                    "asset_id": asset_id,
+                    "market_id": position.get("market_id"),
+                    "question": position.get("question"),
+                    "outcome": position.get("outcome"),
+                    "shares": shares,
+                    "limit_price": limit_price,
+                    "attempt": attempt,
+                    "response": response,
+                },
+            )
+            save_json(LIVE_STATE_FILE, state)
+            return True
+        except Exception as error:
+            last_error = error
+            journal_entry(
+                state,
+                "SELL_LIMIT_FAILED",
+                {
+                    "asset_id": asset_id,
+                    "market_id": position.get("market_id"),
+                    "question": position.get("question"),
+                    "outcome": position.get("outcome"),
+                    "shares": shares,
+                    "limit_price": limit_price,
+                    "attempt": attempt,
+                    "error": str(error),
+                },
+            )
+            save_json(LIVE_STATE_FILE, state)
+            if response_has_no_orderbook(error):
+                log(
+                    f"Protective SELL LIMIT skipped for {asset_id}: {error}",
+                    level="WARNING",
+                    tg=True,
+                )
+                break
+            time.sleep(LIMIT_ORDER_RETRY_DELAY_SECONDS)
+
+    prefix = notify_prefix or "Protective SELL LIMIT failed"
+    log(
+        f"{prefix} for {position.get('question', 'Unknown market')[:80]}: {last_error}",
+        level="ERROR",
+        tg=True,
+    )
+    return False
+
+def cancel_orphan_limit_orders(execution_client, state, sync_snapshot):
+    active_asset_ids = {str(position.get("asset_id")) for position in state.get("active_positions", [])}
+    open_orders = sync_snapshot.get("open_orders", [])
+    changed = False
+
+    for order in open_orders:
+        asset_id = str(order.get("asset_id") or order.get("assetId") or order.get("token_id") or "")
+        side = str(order.get("side") or "").upper()
+        if side != "SELL":
+            continue
+        if asset_id in active_asset_ids:
+            continue
+        order_id = order.get("id") or order.get("orderID") or order.get("orderId")
+        if not order_id:
+            continue
+        try:
+            execution_client.cancel_order_by_id(order_id)
+            changed = True
+            journal_entry(state, "ORPHAN_LIMIT_CANCELLED", {"asset_id": asset_id, "order_id": str(order_id)})
+        except Exception as error:
+            journal_entry(state, "ORPHAN_LIMIT_CANCEL_FAILED", {"asset_id": asset_id, "order_id": str(order_id), "error": str(error)})
+            log(f"Failed to cancel orphan limit order {order_id}: {error}", level="WARNING")
+
+    for asset_id in list(state.get("limit_orders", {}).keys()):
+        if str(asset_id) not in active_asset_ids:
+            clear_limit_order(state, asset_id)
+            changed = True
+
+    if changed:
+        save_json(LIVE_STATE_FILE, state)
+    return changed
+
+def cancel_tracked_limit_order(execution_client, state, asset_id):
+    tracked = get_limit_order(state, asset_id)
+    if not tracked or not tracked.get("order_id"):
+        return False
+    try:
+        execution_client.cancel_order_by_id(tracked["order_id"])
+        journal_entry(state, "SELL_LIMIT_CANCELLED", {"asset_id": str(asset_id), "order_id": str(tracked["order_id"])})
+    except Exception as error:
+        journal_entry(state, "SELL_LIMIT_CANCEL_FAILED", {"asset_id": str(asset_id), "order_id": str(tracked["order_id"]), "error": str(error)})
+        log(f"Failed to cancel protective limit order {tracked['order_id']}: {error}", level="WARNING")
+        return False
+    clear_limit_order(state, asset_id)
+    save_json(LIVE_STATE_FILE, state)
+    return True
+
+def recover_state(execution_client, state):
+    state["recovery"] = {
+        "last_started_at": utc_now().isoformat(),
+        "last_completed_at": None,
+        "last_status": "running",
+    }
+    save_json(LIVE_STATE_FILE, state)
+    sync_snapshot = sync_exchange(execution_client, state)
+    cancel_orphan_limit_orders(execution_client, state, sync_snapshot)
+    sync_snapshot = sync_exchange(execution_client, state)
+    for position in state.get("active_positions", []):
+        ensure_protective_limit_order(
+            execution_client,
+            state,
+            position,
+            sync_snapshot=sync_snapshot,
+            notify_prefix="Recovery protective SELL LIMIT failed",
+        )
+    state["recovery"] = {
+        "last_started_at": state["recovery"].get("last_started_at"),
+        "last_completed_at": utc_now().isoformat(),
+        "last_status": "completed",
+    }
+    save_json(LIVE_STATE_FILE, state)
+    return sync_snapshot
+
 def position_is_in_cooldown(state, market_id):
     cooldown_until = state.get("cooldowns", {}).get(str(market_id))
     if not cooldown_until:
@@ -932,6 +1407,10 @@ def has_open_order(sync_snapshot, token_id):
     return False
 
 def attempt_entries(execution_client, state, sync_snapshot):
+    if transaction_in_flight(state):
+        log("Skipping entries: previous transaction is still awaiting confirmation.", level="WARNING")
+        return False
+
     available_balance = sync_snapshot.get("available_balance")
     
     if available_balance is None:
@@ -951,7 +1430,12 @@ def attempt_entries(execution_client, state, sync_snapshot):
     did_trade = False
 
     for candidate in candidates:
+        seconds_left = seconds_until_expiry(candidate.get("end_date"))
+        if seconds_left is None or seconds_left <= 0 or seconds_left > ENTRY_WINDOW_MINUTES * 60:
+            continue
         if position_is_in_cooldown(state, candidate["market_id"]):
+            continue
+        if is_market_banned(state, candidate["market_id"]):
             continue
         if has_open_position(state, candidate["token_id"]):
             continue
@@ -959,6 +1443,21 @@ def attempt_entries(execution_client, state, sync_snapshot):
             continue
         if has_open_order(sync_snapshot, candidate["token_id"]):
             continue
+        token_balance = execution_client.get_token_balance(candidate["token_id"])
+        if token_balance is None:
+            log(f"Skipping entry for {candidate['token_id']}: unable to verify token balance.", level="WARNING")
+            continue
+        if token_balance > 0:
+            log(
+                f"Blocking BUY for token {candidate['token_id']}: on-chain/API balance is {token_balance}.",
+                level="INFO",
+            )
+            continue
+
+        acquired = execution_lock.acquire(timeout=1)
+        if not acquired:
+            log("Skipping entry: another transaction is still being processed.", level="WARNING")
+            return did_trade
 
         try:
             entry_price = execution_client.get_market_execution_price(
@@ -983,6 +1482,13 @@ def attempt_entries(execution_client, state, sync_snapshot):
             if expected_profit_pct < MIN_PROFIT_PERCENT * 100.0:
                 continue
 
+            begin_transaction(
+                state,
+                "BUY",
+                token_id=candidate["token_id"],
+                market_id=candidate["market_id"],
+                extra={"question": candidate["question"][:120]},
+            )
             response = execution_client.place_market_buy(
                 token_id=candidate["token_id"],
                 usdc_amount=BET_AMOUNT,
@@ -1011,8 +1517,14 @@ def attempt_entries(execution_client, state, sync_snapshot):
             )
             log(msg, tg=True)
             
-            did_trade = True
-            sync_snapshot = sync_exchange(execution_client, state)
+            confirmed, sync_snapshot = await_position_sync(
+                execution_client,
+                state,
+                candidate["token_id"],
+                should_exist=True,
+            )
+            if not confirmed:
+                raise TimeoutError(f"BUY confirmation timeout for token {candidate['token_id']}")
 
             for position in state.get("active_positions",[]):
                 if str(position.get("asset_id")) == str(candidate["token_id"]):
@@ -1025,14 +1537,28 @@ def attempt_entries(execution_client, state, sync_snapshot):
                     position["max_recent_price"] = candidate["max_recent_price"]
                     position["tick_size"] = candidate["tick_size"]
                     position["end_date"] = candidate["end_date"]
+                    position["is_sports_market"] = bool(candidate.get("is_sports_market"))
                     if not position.get("opened_at"):
-                        position["opened_at"] = datetime.now(timezone.utc).isoformat()
+                        position["opened_at"] = utc_now().isoformat()
+                    ensure_protective_limit_order(
+                        execution_client,
+                        state,
+                        position,
+                        sync_snapshot=sync_snapshot,
+                        notify_prefix="Immediate SELL LIMIT failed after BUY",
+                    )
             save_json(LIVE_STATE_FILE, state)
+            complete_transaction(state, "confirmed")
+            did_trade = True
             break
         except Exception as error:
             journal_entry(state, "BUY_FAILED", {"market_id": candidate["market_id"], "token_id": candidate["token_id"], "error": str(error)})
             log(f"Live BUY failed: {error}", level="ERROR", tg=True)
+            complete_transaction(state, "failed", error=error)
             save_json(LIVE_STATE_FILE, state)
+        finally:
+            if execution_lock.locked():
+                execution_lock.release()
 
     return did_trade
 
@@ -1098,8 +1624,9 @@ def attempt_exits(execution_client, state, sync_snapshot=None):
 
 def main():
     log(f"Starting live swing service for Polymarket. Using py-clob-client V2.", tg=True)
+    service_stop_event.clear()
 
-    state = load_json(LIVE_STATE_FILE, default_live_state())
+    state = ensure_live_state_schema(load_json(LIVE_STATE_FILE, default_live_state()))
     cleanup_cooldowns(state)
     save_json(LIVE_STATE_FILE, state)
 
@@ -1110,7 +1637,7 @@ def main():
         log(f"Failed to initialize Polymarket client: {e}", "ERROR", tg=True)
         sys.exit(1)
 
-    sync_snapshot = sync_exchange(execution_client, state)
+    sync_snapshot = recover_state(execution_client, state)
     save_json(LIVE_SYNC_FILE, sync_snapshot)
     update_telegram_runtime_state(state, sync_snapshot)
     start_telegram_bot()
@@ -1127,35 +1654,40 @@ def main():
     )
 
     try:
-        while True:
+        while not service_stop_event.is_set():
             try:
                 cleanup_cooldowns(state)
                 sync_snapshot = sync_exchange(execution_client, state)
                 finalize_completed_pending_exits(state, sync_snapshot)
+                cancel_orphan_limit_orders(execution_client, state, sync_snapshot)
                 update_telegram_runtime_state(state, sync_snapshot)
                 if attempt_pending_exits(execution_client, state):
                     sync_snapshot = sync_exchange(execution_client, state)
                     finalize_completed_pending_exits(state, sync_snapshot)
+                    cancel_orphan_limit_orders(execution_client, state, sync_snapshot)
                     update_telegram_runtime_state(state, sync_snapshot)
                 attempt_exits(execution_client, state, sync_snapshot)
                 sync_snapshot = sync_exchange(execution_client, state)
                 finalize_completed_pending_exits(state, sync_snapshot)
+                cancel_orphan_limit_orders(execution_client, state, sync_snapshot)
                 update_telegram_runtime_state(state, sync_snapshot)
                 attempt_entries(execution_client, state, sync_snapshot)
-                state["last_cycle_at"] = datetime.now(timezone.utc).isoformat()
+                state["last_cycle_at"] = utc_now().isoformat()
                 save_json(LIVE_STATE_FILE, state)
                 update_telegram_runtime_state(state, sync_snapshot)
                 sleep_seconds = EXIT_RETRY_SECONDS if state.get("pending_exits") else CHECK_INTERVAL_SECONDS
-                time.sleep(sleep_seconds)
+                service_stop_event.wait(sleep_seconds)
             except requests.exceptions.RequestException as error:
                 log(f"Network error: {error}", level="WARNING")
-                time.sleep(EXIT_RETRY_SECONDS if state.get("pending_exits") else CHECK_INTERVAL_SECONDS)
+                service_stop_event.wait(EXIT_RETRY_SECONDS if state.get("pending_exits") else CHECK_INTERVAL_SECONDS)
             except Exception:
                 err_trace = traceback.format_exc()
                 log(f"Cycle failure:\n{err_trace}", level="ERROR", tg=True)
-                time.sleep(EXIT_RETRY_SECONDS if state.get("pending_exits") else CHECK_INTERVAL_SECONDS)
+                service_stop_event.wait(EXIT_RETRY_SECONDS if state.get("pending_exits") else CHECK_INTERVAL_SECONDS)
     except KeyboardInterrupt:
         log("Live swing service stopped by user.", tg=True)
+    if service_stop_event.is_set():
+        log("Live swing service stopped by Telegram command.", tg=True)
 
 if __name__ == "__main__":
     main()
