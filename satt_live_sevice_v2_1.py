@@ -1457,7 +1457,10 @@ def has_recent_buy(state, token_id, minutes=BUY_COOLDOWN_MINUTES):
                 ts = parse_datetime(entry.get("ts"))
                 if ts and ts > cutoff:
                     return True
+                # Found matching token but too old — stop searching
                 return False
+            # Different token — keep looking
+            continue
     return False
 
 def attempt_entries(execution_client, state, sync_snapshot):
