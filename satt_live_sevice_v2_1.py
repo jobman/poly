@@ -1508,7 +1508,7 @@ def attempt_entries(execution_client, state, sync_snapshot):
             stats["balance_err"] += 1
             log(f"Skipping entry for {candidate['token_id']}: unable to verify token balance.", level="WARNING")
             continue
-        if token_balance > 0.001:
+        if token_balance > 0.01:
             stats["has_balance"] += 1
             log(
                 f"Blocking BUY for token {candidate['token_id']}: on-chain/API balance is {token_balance:.4f}.",
