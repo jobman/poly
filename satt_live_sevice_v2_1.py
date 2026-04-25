@@ -1690,15 +1690,23 @@ def attempt_exits(execution_client, state, sync_snapshot=None):
         if opened_at.tzinfo is None:
             opened_at = opened_at.replace(tzinfo=timezone.utc)
         hours_held = (now - opened_at).total_seconds() / 3600.0
+        stop_loss_price = avg_price * STOP_LOSS_MULTIPLIER if avg_price > 0 else 0.0
+        log(
+            f"[attempt_exits] {position.get('question', 'Unknown')[:60]}: "
+            f"avg={avg_price:.3f} current={current_price:.3f} target={target_price:.3f} "
+            f"sl={stop_loss_price:.3f} held={hours_held:.2f}h"
+        )
 
         if avg_price > 0 and current_price >= target_price:
             sell_price = round_price_to_tick(current_price, tick_size)
+            log(f"[attempt_exits] TRIGGER TP: current={current_price:.3f} >= target={target_price:.3f}")
             if close_position(execution_client, state, position, f"🤑 DYNAMIC TP HIT @ ${sell_price:.3f}", sell_price, "SELL_TAKE_PROFIT", sync_snapshot=sync_snapshot):
                 did_trade = True
                 break
 
-        if avg_price > 0 and current_price <= avg_price * STOP_LOSS_MULTIPLIER:
+        if avg_price > 0 and current_price <= stop_loss_price:
             sell_price = round_price_to_tick(current_price, tick_size)
+            log(f"[attempt_exits] TRIGGER SL: current={current_price:.3f} <= sl={stop_loss_price:.3f}")
             if close_position(execution_client, state, position, f"⛔ STOP LOSS HIT @ ${sell_price:.3f}", sell_price, "SELL_STOP_LOSS", sync_snapshot=sync_snapshot):
                 cooldown_until = (now + timedelta(hours=COOLDOWN_HOURS)).timestamp()
                 market_id = str(position.get("market_id") or "")
@@ -1709,6 +1717,7 @@ def attempt_exits(execution_client, state, sync_snapshot=None):
 
         if hours_held >= MAX_HOLD_HOURS:
             sell_price = round_price_to_tick(current_price, tick_size)
+            log(f"[attempt_exits] TRIGGER TIME: held={hours_held:.2f}h >= max={MAX_HOLD_HOURS}h")
             if close_position(execution_client, state, position, f"⏱️ TIME STOP ({MAX_HOLD_HOURS}h) @ ${sell_price:.3f}", sell_price, "SELL_TIME_STOP", sync_snapshot=sync_snapshot):
                 did_trade = True
                 break
