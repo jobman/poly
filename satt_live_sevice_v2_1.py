@@ -673,7 +673,7 @@ def collect_valid_events():
             seconds_left = seconds_until_expiry(end_date_str)
             if seconds_left is None or seconds_left <= 0:
                 continue
-            if seconds_left > ENTRY_WINDOW_MINUTES * 60:
+            if seconds_left < MIN_DAYS_TO_EXPIRY * 24 * 3600:
                 continue
             if float(event.get("volume", 0)) < MIN_VOLUME:
                 continue
@@ -1431,7 +1431,7 @@ def attempt_entries(execution_client, state, sync_snapshot):
 
     for candidate in candidates:
         seconds_left = seconds_until_expiry(candidate.get("end_date"))
-        if seconds_left is None or seconds_left <= 0 or seconds_left > ENTRY_WINDOW_MINUTES * 60:
+        if seconds_left is None or seconds_left <= 0 or seconds_left < MIN_DAYS_TO_EXPIRY * 24 * 3600:
             continue
         if position_is_in_cooldown(state, candidate["market_id"]):
             continue
