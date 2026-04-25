@@ -1410,14 +1410,9 @@ def recover_state(execution_client, state):
     sync_snapshot = sync_exchange(execution_client, state)
     cancel_orphan_limit_orders(execution_client, state, sync_snapshot)
     sync_snapshot = sync_exchange(execution_client, state)
-    for position in state.get("active_positions", []):
-        ensure_protective_limit_order(
-            execution_client,
-            state,
-            position,
-            sync_snapshot=sync_snapshot,
-            notify_prefix="Recovery protective SELL LIMIT failed",
-        )
+    # NOTE: ensure_protective_limit_order removed — limit sell below market
+    # price on Polymarket CLOB executes immediately as a market sell.
+    # Stop-loss is handled by attempt_exits every cycle instead.
     state["recovery"] = {
         "last_started_at": state["recovery"].get("last_started_at"),
         "last_completed_at": utc_now().isoformat(),
@@ -1626,13 +1621,8 @@ def attempt_entries(execution_client, state, sync_snapshot):
                     position["is_sports_market"] = bool(candidate.get("is_sports_market"))
                     if not position.get("opened_at"):
                         position["opened_at"] = utc_now().isoformat()
-                    ensure_protective_limit_order(
-                        execution_client,
-                        state,
-                        position,
-                        sync_snapshot=sync_snapshot,
-                        notify_prefix="Immediate SELL LIMIT failed after BUY",
-                    )
+                    # NOTE: protective limit order removed — on Polymarket CLOB
+                    # limit sell below market executes immediately. SL handled by attempt_exits.
             save_json(LIVE_STATE_FILE, state)
             complete_transaction(state, "confirmed")
             did_trade = True
