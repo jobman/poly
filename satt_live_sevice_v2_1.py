@@ -45,6 +45,7 @@ RECOVERY_TARGET_PERCENT = 0.50
 MIN_PROFIT_PERCENT = 0.15
 STOP_LOSS_MULTIPLIER = 0.50
 MAX_HOLD_HOURS = 24.0
+EARLY_PROFIT_EXIT_HOURS_BEFORE_MAX_HOLD = 12.0
 COOLDOWN_HOURS = 4.0
 MARKET_BAN_HOURS = 4.0
 MIN_LIQUIDITY = 5000.0
@@ -52,6 +53,7 @@ MIN_VOLUME = 20000.0
 MIN_DAYS_TO_EXPIRY = 2.0
 CHECK_INTERVAL_SECONDS = 30
 EXIT_RETRY_SECONDS = 10
+EXIT_NO_ORDERBOOK_RETRY_SECONDS = 3600
 ENTRY_WINDOW_MINUTES = 10
 BUY_COOLDOWN_MINUTES = 15
 TX_CONFIRM_TIMEOUT_SECONDS = 90
@@ -873,6 +875,9 @@ def response_has_no_orderbook(error):
     text = str(error).lower()
     return error.status_code == 404 or "no orderbook" in text or "no match" in text
 
+def early_profit_exit_hours():
+    return max(0.0, MAX_HOLD_HOURS - EARLY_PROFIT_EXIT_HOURS_BEFORE_MAX_HOLD)
+
 def queue_pending_exit(state, position, reason, journal_action, sell_price, sync_snapshot=None):
     asset_id = str(position.get("asset_id"))
     pending_exits = state.setdefault("pending_exits", {})
@@ -891,7 +896,10 @@ def queue_pending_exit(state, position, reason, journal_action, sell_price, sync
         "sell_price": sell_price,
         "first_detected_at": datetime.now(timezone.utc).isoformat(),
         "last_attempt_ts": 0.0,
+        "retry_after_ts": 0.0,
         "attempts": 0,
+        "no_orderbook_attempts": 0,
+        "no_orderbook_notified": False,
         "entry_price": safe_float(position.get("avg_price", position.get("buy_price", 0.0))),
         "entry_cost": safe_float(position.get("cost")),
         "initial_shares": safe_float(position.get("shares")),
@@ -959,6 +967,7 @@ def finalize_completed_pending_exits(state, sync_snapshot=None):
                     "entry_cost": entry_cost,
                     "initial_shares": initial_shares,
                     "sell_price": actual_sell_price,
+                    "actual_sell_price": actual_sell_price,
                     "estimated_sell_price": pending.get("sell_price"),
                     "realized_proceeds": realized_proceeds,
                     "pnl_usdc": pnl_usdc,
@@ -970,10 +979,16 @@ def finalize_completed_pending_exits(state, sync_snapshot=None):
             )
             pending["completion_recorded"] = True
             complete_transaction(state, "confirmed")
+            estimated_sell_price = safe_float(pending.get("sell_price"), default=None)
             summary = [
                 f"✅ EXIT COMPLETED after {pending.get('attempts', 0)} attempt(s)",
                 f"Buy: ${safe_float(pending.get('entry_price')):.3f} | Sell: ${safe_float(actual_sell_price):.3f}",
             ]
+            if pending.get("journal_action") in {"SELL_TAKE_PROFIT", "SELL_STOP_LOSS"}:
+                summary.append(
+                    f"Expected sell: ${safe_float(estimated_sell_price):.3f} | "
+                    f"Actual sell: ${safe_float(actual_sell_price):.3f}"
+                )
             if pnl_usdc is not None and pnl_pct is not None:
                 summary.append(f"PnL: {pnl_usdc:+.3f} USDC ({pnl_pct:+.2f}%)")
             summary.append(f"Market: <i>{str(pending.get('question', 'Unknown market'))[:80]}</i>")
@@ -1000,6 +1015,10 @@ def attempt_pending_exits(execution_client, state, force_asset_id=None):
         if not pending:
             continue
 
+        retry_after_ts = safe_float(pending.get("retry_after_ts"))
+        if retry_after_ts > now_ts:
+            continue
+
         if not force_asset_id and now_ts - safe_float(pending.get("last_attempt_ts")) < EXIT_RETRY_SECONDS:
             continue
 
@@ -1011,8 +1030,16 @@ def attempt_pending_exits(execution_client, state, force_asset_id=None):
         if shares <= 0:
             continue
 
+        executable_sell_price = execution_client.get_market_execution_price(
+            token_id=position["asset_id"],
+            side=Side.SELL,
+            amount=shares,
+        )
         sell_price = round_price_to_tick(
-            safe_float(position.get("current_price", position.get("avg_price", 0.0))),
+            safe_float(
+                executable_sell_price,
+                default=safe_float(position.get("current_price", position.get("avg_price", 0.0))),
+            ),
             position.get("tick_size", "0.01"),
         )
         pending["sell_price"] = sell_price
@@ -1069,6 +1096,44 @@ def attempt_pending_exits(execution_client, state, force_asset_id=None):
             did_trade = True
         except Exception as error:
             pending["last_error"] = str(error)
+            if response_has_no_orderbook(error):
+                pending["no_orderbook_attempts"] = int(pending.get("no_orderbook_attempts", 0)) + 1
+                pending["retry_after_ts"] = now_ts + EXIT_NO_ORDERBOOK_RETRY_SECONDS
+                state["pending_exits"][str(asset_id)] = pending
+                ban_market(state, position.get("market_id"), hours=MARKET_BAN_HOURS)
+                journal_entry(
+                    state,
+                    "SELL_ORDERBOOK_UNAVAILABLE",
+                    {
+                        "asset_id": position["asset_id"],
+                        "question": position.get("question"),
+                        "outcome": position.get("outcome"),
+                        "shares": shares,
+                        "sell_price": sell_price,
+                        "reason": pending.get("reason"),
+                        "attempt_number": pending["attempts"],
+                        "retry_after_seconds": EXIT_NO_ORDERBOOK_RETRY_SECONDS,
+                        "error": str(error),
+                    },
+                )
+                if not pending.get("no_orderbook_notified"):
+                    pending["no_orderbook_notified"] = True
+                    state["pending_exits"][str(asset_id)] = pending
+                    log(
+                        f"{pending['reason']} deferred: no orderbook for token {asset_id}. "
+                        f"Will retry every {EXIT_NO_ORDERBOOK_RETRY_SECONDS // 60} minutes.",
+                        level="WARNING",
+                        tg=True,
+                    )
+                else:
+                    log(
+                        f"{pending['reason']} deferred: no orderbook for token {asset_id}.",
+                        level="WARNING",
+                    )
+                complete_transaction(state, "failed", error=error)
+                save_json(LIVE_STATE_FILE, state)
+                continue
+
             state["pending_exits"][str(asset_id)] = pending
             journal_entry(
                 state,
@@ -1172,7 +1237,7 @@ def get_stat_counts(state):
         if action == "SELL_TAKE_PROFIT":
             counts["TP"] += 1
             counts["CLOSED"] += 1
-        elif action == "SELL_TIME_STOP":
+        elif action in {"SELL_TIME_STOP", "SELL_EARLY_PROFIT"}:
             counts["SAFE"] += 1
             counts["CLOSED"] += 1
         elif action == "SELL_STOP_LOSS":
@@ -1691,6 +1756,30 @@ def attempt_exits(execution_client, state, sync_snapshot=None):
             sell_price = round_price_to_tick(current_price, tick_size)
             log(f"[attempt_exits] TRIGGER TP: current={current_price:.3f} >= target={target_price:.3f}")
             if close_position(execution_client, state, position, f"🤑 DYNAMIC TP HIT @ ${sell_price:.3f}", sell_price, "SELL_TAKE_PROFIT", sync_snapshot=sync_snapshot):
+                did_trade = True
+                break
+
+        early_profit_hours = early_profit_exit_hours()
+        if (
+            avg_price > 0
+            and hours_held >= early_profit_hours
+            and hours_held < MAX_HOLD_HOURS
+            and current_price > avg_price
+        ):
+            sell_price = round_price_to_tick(current_price, tick_size)
+            log(
+                f"[attempt_exits] TRIGGER EARLY PROFIT: held={hours_held:.2f}h >= {early_profit_hours:.2f}h "
+                f"and current={current_price:.3f} > avg={avg_price:.3f}"
+            )
+            if close_position(
+                execution_client,
+                state,
+                position,
+                f"EARLY PROFIT EXIT @ ${sell_price:.3f}",
+                sell_price,
+                "SELL_EARLY_PROFIT",
+                sync_snapshot=sync_snapshot,
+            ):
                 did_trade = True
                 break
 
