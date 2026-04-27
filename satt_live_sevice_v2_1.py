@@ -672,6 +672,7 @@ def collect_valid_events():
         "expired": 0,
         "too_soon": 0,
         "low_volume": 0,
+        "sports": 0,
         "no_eligible_markets": 0,
         "accepted": 0,
         "eligible_markets": 0,
@@ -712,6 +713,9 @@ def collect_valid_events():
                 stats["low_volume"] += 1
                 continue
             event["is_sports_market"] = event_is_sports(event)
+            if event["is_sports_market"]:
+                stats["sports"] += 1
+                continue
 
             eligible_markets = []
             for market in event.get("markets", []):
@@ -737,7 +741,8 @@ def collect_valid_events():
     log(
         f"[collect_valid_events] total={stats['total_events']} accepted={stats['accepted']} "
         f"no_end_date={stats['no_end_date']} expired={stats['expired']} too_soon={stats['too_soon']} "
-        f"low_volume={stats['low_volume']} no_markets={stats['no_eligible_markets']} markets={stats['eligible_markets']}"
+        f"low_volume={stats['low_volume']} sports={stats['sports']} "
+        f"no_markets={stats['no_eligible_markets']} markets={stats['eligible_markets']}"
     )
     return valid_events
 
