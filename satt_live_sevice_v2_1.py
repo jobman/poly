@@ -55,6 +55,7 @@ CHECK_INTERVAL_SECONDS = 30
 EXIT_RETRY_SECONDS = 10
 EXIT_NO_ORDERBOOK_RETRY_SECONDS = 3600
 EXIT_ORDER_VERSION_RETRY_SECONDS = 60
+EXIT_ALLOWANCE_RETRY_SECONDS = 60
 ENTRY_WINDOW_MINUTES = 10
 BUY_COOLDOWN_MINUTES = 15
 TX_CONFIRM_TIMEOUT_SECONDS = 90
@@ -493,6 +494,32 @@ class PolymarketExecutionClient:
             log(f"Failed to load conditional balance for {token_id}: {error}", level="WARNING")
             return None
 
+    def get_token_balance_allowance(self, token_id):
+        try:
+            return self.client.get_balance_allowance(
+                BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL,
+                    token_id=str(token_id),
+                    signature_type=self.signature_type,
+                )
+            )
+        except Exception as error:
+            log(f"Failed to load conditional balance/allowance for {token_id}: {error}", level="WARNING")
+            return None
+
+    def update_token_allowance(self, token_id):
+        try:
+            return self.client.update_balance_allowance(
+                BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL,
+                    token_id=str(token_id),
+                    signature_type=self.signature_type,
+                )
+            )
+        except Exception as error:
+            log(f"Failed to update conditional allowance for {token_id}: {error}", level="WARNING")
+            return None
+
     def get_positions(self):
         if not self.profile_address:
             return[]
@@ -883,6 +910,10 @@ def response_has_no_orderbook(error):
 def response_has_order_version_mismatch(error):
     return "order_version_mismatch" in str(error).lower()
 
+def response_has_allowance_error(error):
+    text = str(error).lower()
+    return "not enough balance / allowance" in text or "allowance is not enough" in text
+
 def early_profit_exit_hours():
     return max(0.0, MAX_HOLD_HOURS - EARLY_PROFIT_EXIT_HOURS_BEFORE_MAX_HOLD)
 
@@ -910,6 +941,8 @@ def queue_pending_exit(state, position, reason, journal_action, sell_price, sync
         "no_orderbook_notified": False,
         "order_version_mismatch_attempts": 0,
         "order_version_mismatch_notified": False,
+        "allowance_update_attempts": 0,
+        "allowance_update_notified": False,
         "entry_price": safe_float(position.get("avg_price", position.get("buy_price", 0.0))),
         "entry_cost": safe_float(position.get("cost")),
         "initial_shares": safe_float(position.get("shares")),
@@ -1177,6 +1210,48 @@ def attempt_pending_exits(execution_client, state, force_asset_id=None):
                 else:
                     log(
                         f"{pending['reason']} deferred: order book changed before execution.",
+                        level="WARNING",
+                    )
+                complete_transaction(state, "failed", error=error)
+                save_json(LIVE_STATE_FILE, state)
+                continue
+
+            if response_has_allowance_error(error):
+                pending["allowance_update_attempts"] = int(
+                    pending.get("allowance_update_attempts", 0)
+                ) + 1
+                allowance_response = execution_client.update_token_allowance(position["asset_id"])
+                pending["last_allowance_update_response"] = str(allowance_response)
+                pending["retry_after_ts"] = now_ts + EXIT_ALLOWANCE_RETRY_SECONDS
+                state["pending_exits"][str(asset_id)] = pending
+                journal_entry(
+                    state,
+                    "SELL_ALLOWANCE_UPDATE",
+                    {
+                        "asset_id": position["asset_id"],
+                        "question": position.get("question"),
+                        "outcome": position.get("outcome"),
+                        "shares": shares,
+                        "sell_price": sell_price,
+                        "reason": pending.get("reason"),
+                        "attempt_number": pending["attempts"],
+                        "retry_after_seconds": EXIT_ALLOWANCE_RETRY_SECONDS,
+                        "allowance_response": allowance_response,
+                        "error": str(error),
+                    },
+                )
+                if not pending.get("allowance_update_notified"):
+                    pending["allowance_update_notified"] = True
+                    state["pending_exits"][str(asset_id)] = pending
+                    log(
+                        f"{pending['reason']} deferred: conditional token allowance was missing. "
+                        f"Requested allowance update and will retry in {EXIT_ALLOWANCE_RETRY_SECONDS} seconds.",
+                        level="WARNING",
+                        tg=True,
+                    )
+                else:
+                    log(
+                        f"{pending['reason']} deferred: conditional token allowance update requested.",
                         level="WARNING",
                     )
                 complete_transaction(state, "failed", error=error)
