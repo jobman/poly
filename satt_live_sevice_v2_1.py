@@ -54,6 +54,7 @@ MIN_DAYS_TO_EXPIRY = 2.0
 CHECK_INTERVAL_SECONDS = 30
 EXIT_RETRY_SECONDS = 10
 EXIT_NO_ORDERBOOK_RETRY_SECONDS = 3600
+EXIT_ORDER_VERSION_RETRY_SECONDS = 60
 ENTRY_WINDOW_MINUTES = 10
 BUY_COOLDOWN_MINUTES = 15
 TX_CONFIRM_TIMEOUT_SECONDS = 90
@@ -875,10 +876,12 @@ def resolve_order_id(response):
     return None
 
 def response_has_no_orderbook(error):
-    if not isinstance(error, PolyApiException):
-        return False
     text = str(error).lower()
-    return error.status_code == 404 or "no orderbook" in text or "no match" in text
+    status_code = getattr(error, "status_code", None)
+    return status_code == 404 or "no orderbook" in text or "no match" in text
+
+def response_has_order_version_mismatch(error):
+    return "order_version_mismatch" in str(error).lower()
 
 def early_profit_exit_hours():
     return max(0.0, MAX_HOLD_HOURS - EARLY_PROFIT_EXIT_HOURS_BEFORE_MAX_HOLD)
@@ -905,6 +908,8 @@ def queue_pending_exit(state, position, reason, journal_action, sell_price, sync
         "attempts": 0,
         "no_orderbook_attempts": 0,
         "no_orderbook_notified": False,
+        "order_version_mismatch_attempts": 0,
+        "order_version_mismatch_notified": False,
         "entry_price": safe_float(position.get("avg_price", position.get("buy_price", 0.0))),
         "entry_cost": safe_float(position.get("cost")),
         "initial_shares": safe_float(position.get("shares")),
@@ -1125,14 +1130,53 @@ def attempt_pending_exits(execution_client, state, force_asset_id=None):
                     pending["no_orderbook_notified"] = True
                     state["pending_exits"][str(asset_id)] = pending
                     log(
-                        f"{pending['reason']} deferred: no orderbook for token {asset_id}. "
+                        f"{pending['reason']} deferred: no orderbook/liquidity for token {asset_id}. "
                         f"Will retry every {EXIT_NO_ORDERBOOK_RETRY_SECONDS // 60} minutes.",
                         level="WARNING",
                         tg=True,
                     )
                 else:
                     log(
-                        f"{pending['reason']} deferred: no orderbook for token {asset_id}.",
+                        f"{pending['reason']} deferred: no orderbook/liquidity for token {asset_id}.",
+                        level="WARNING",
+                    )
+                complete_transaction(state, "failed", error=error)
+                save_json(LIVE_STATE_FILE, state)
+                continue
+
+            if response_has_order_version_mismatch(error):
+                pending["order_version_mismatch_attempts"] = int(
+                    pending.get("order_version_mismatch_attempts", 0)
+                ) + 1
+                pending["retry_after_ts"] = now_ts + EXIT_ORDER_VERSION_RETRY_SECONDS
+                state["pending_exits"][str(asset_id)] = pending
+                journal_entry(
+                    state,
+                    "SELL_ORDER_VERSION_MISMATCH",
+                    {
+                        "asset_id": position["asset_id"],
+                        "question": position.get("question"),
+                        "outcome": position.get("outcome"),
+                        "shares": shares,
+                        "sell_price": sell_price,
+                        "reason": pending.get("reason"),
+                        "attempt_number": pending["attempts"],
+                        "retry_after_seconds": EXIT_ORDER_VERSION_RETRY_SECONDS,
+                        "error": str(error),
+                    },
+                )
+                if not pending.get("order_version_mismatch_notified"):
+                    pending["order_version_mismatch_notified"] = True
+                    state["pending_exits"][str(asset_id)] = pending
+                    log(
+                        f"{pending['reason']} deferred: order book changed before execution. "
+                        f"Will retry in {EXIT_ORDER_VERSION_RETRY_SECONDS} seconds.",
+                        level="WARNING",
+                        tg=True,
+                    )
+                else:
+                    log(
+                        f"{pending['reason']} deferred: order book changed before execution.",
                         level="WARNING",
                     )
                 complete_transaction(state, "failed", error=error)
