@@ -5,6 +5,7 @@ import asyncio
 import threading
 import time
 import traceback
+from html import escape
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
@@ -101,6 +102,9 @@ def safe_float(value, default=0.0):
     try: return float(value)
     except: return default
 
+def fmt_usd(value): return f"${safe_float(value):.2f}"
+def fmt_price(value): return f"${safe_float(value):.4f}"
+
 def micro_to_usdc(value): return safe_float(value) / USDC_DECIMALS
 
 def parse_token_ids(market):
@@ -113,6 +117,12 @@ def parse_outcome_prices(market):
     try: return [float(item) for item in json.loads(market.get("outcomePrices", "[]"))]
     except: return []
 
+def parse_outcomes(market):
+    raw = market.get("outcomes", "[]")
+    if isinstance(raw, list): return [str(item) for item in raw]
+    try: return [str(item) for item in json.loads(raw)]
+    except: return []
+
 def get_tick_size(market): return str(market.get("orderPriceMinTickSize") or market.get("priceTickSize") or market.get("minimumTickSize") or "0.01")
 def round_price_to_tick(price, tick_size):
     tick = float(tick_size) if float(tick_size) > 0 else 0.01
@@ -122,6 +132,7 @@ def default_live_state():
     return {
         "service": "paper_live_service", "active_positions":[], "journal":[], "cooldowns": {}, "market_bans": {},
         "pending_exits": {}, "limit_orders": {}, "transaction": None,
+        "stats": {"WON": 0, "TP": 0, "SAFE": 0, "SL": 0, "LOST": 0},
         "recovery": {"last_started_at": None, "last_completed_at": None, "last_status": None}, "last_cycle_at": None,
     }
 
@@ -129,6 +140,9 @@ def ensure_live_state_schema(state):
     base = default_live_state()
     for key, value in base.items():
         if key not in state: state[key] = value
+    stats = state.setdefault("stats", {})
+    for key in ("WON", "TP", "SAFE", "SL", "LOST"):
+        stats.setdefault(key, 0)
     return state
 
 def utc_now(): return datetime.now(timezone.utc)
@@ -148,6 +162,143 @@ def normalize_text(value): return str(value or "").strip().lower()
 def get_sports_tag_ids(): return set()
 def event_is_sports(event): return False
 def position_is_sports(position): return bool(position.get("is_sports_market"))
+
+def admin_chat_ids():
+    return {int(item.strip()) for item in TELEGRAM_ADMIN_IDS.split(",") if item.strip().isdigit()}
+
+def is_admin_update(update):
+    allowed = admin_chat_ids()
+    return not allowed or (update.effective_chat and update.effective_chat.id in allowed)
+
+def get_stats_counts(state):
+    ensure_live_state_schema(state)
+    return {key: int(state.get("stats", {}).get(key, 0)) for key in ("WON", "TP", "SAFE", "SL", "LOST")}
+
+def classify_exit(reason, profit):
+    normalized = normalize_text(reason)
+    if "stop loss" in normalized:
+        return "SL"
+    if "dynamic tp" in normalized or normalized == "tp":
+        return "TP"
+    if "early profit" in normalized or "safe" in normalized:
+        return "SAFE"
+    if profit > 0:
+        return "WON"
+    if profit < 0:
+        return "LOST"
+    return "SAFE"
+
+def record_closed_trade(state, exit_type, profit):
+    ensure_live_state_schema(state)
+    counts = state["stats"]
+    counts[exit_type] = int(counts.get(exit_type, 0)) + 1
+    state.setdefault("journal", []).append({
+        "action": exit_type,
+        "profit": profit,
+        "closed_at": utc_now().isoformat(),
+    })
+
+def build_stats_message(state):
+    state = ensure_live_state_schema(state or load_json(LIVE_STATE_FILE, default_live_state()))
+    wallet = load_json(PAPER_WALLET_FILE, {"usdc": STARTING_BALANCE, "positions": {}})
+    free_balance = safe_float(wallet.get("usdc"))
+    total_assets = safe_float(state.get("portfolio_value"), free_balance)
+    locked = 0.0
+    net_profit = total_assets - STARTING_BALANCE
+    counts = get_stats_counts(state)
+    closed_count = sum(counts.values())
+    active_count = len(state.get("active_positions", []))
+    positive_closed = counts["WON"] + counts["TP"] + counts["SAFE"]
+    win_rate = (positive_closed / closed_count * 100.0) if closed_count else 0.0
+
+    return (
+        f"💰 Free balance: {fmt_usd(free_balance)}\n"
+        f"🔒 Locked: {fmt_usd(locked)}\n"
+        f"💵 Total Assets: {fmt_usd(total_assets)}\n"
+        f"📈 Net Profit: {fmt_usd(net_profit)}\n\n"
+        f"🔄 Active: {active_count} | 📊 Closed: {closed_count}\n"
+        f"🎯 Win Rate: {win_rate:.1f}%\n"
+        f"✅WON:{counts['WON']} | 🤑TP:{counts['TP']} | 🛡️SAFE:{counts['SAFE']} | ⛔️SL:{counts['SL']} | ❌LOST:{counts['LOST']}"
+    )
+
+def build_exit_message(position, reason, shares, sell_price, proceeds, profit, state):
+    avg_price = safe_float(position.get("avg_price"))
+    cost = shares * avg_price
+    profit_pct = (profit / cost * 100.0) if cost else 0.0
+    question = escape(str(position.get("question", "Unknown market")))
+    outcome = escape(str(position.get("outcome", "N/A")))
+    total_assets = safe_float(state.get("portfolio_value"), safe_float(state.get("available_balance")))
+
+    return (
+        f"✅ Виртуальный экзит: {escape(str(reason))}\n"
+        f"📌 {question}\n"
+        f"🎯 Outcome: {outcome}\n"
+        f"📦 Shares: {shares:.4f}\n"
+        f"🛒 Buy: {fmt_price(avg_price)} | 💸 Sell: {fmt_price(sell_price)}\n"
+        f"💵 Value: {fmt_usd(proceeds)}\n"
+        f"📈 Profit: {fmt_usd(profit)} ({profit_pct:+.2f}%)\n\n"
+        f"💰 Free balance: {fmt_usd(state.get('available_balance'))}\n"
+        f"💵 Total Assets: {fmt_usd(total_assets)}\n"
+        f"🔄 Open positions: {len(state.get('active_positions', []))}"
+    )
+
+def set_telegram_snapshot(state):
+    global telegram_shared_state, telegram_shared_snapshot
+    with telegram_state_lock:
+        telegram_shared_state = json.loads(json.dumps(state))
+        telegram_shared_snapshot = {
+            "updated_at": utc_now().isoformat(),
+            "stats": build_stats_message(state),
+        }
+
+async def telegram_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_update(update):
+        return
+    keyboard = ReplyKeyboardMarkup([[TELEGRAM_MENU_BUTTON_STATS]], resize_keyboard=True)
+    await update.effective_chat.send_message("Paper menu", reply_markup=keyboard)
+
+async def telegram_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_update(update):
+        return
+    with telegram_state_lock:
+        message = telegram_shared_snapshot.get("stats") or build_stats_message(telegram_shared_state)
+    await update.effective_chat.send_message(message)
+
+async def telegram_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not is_admin_update(update):
+        return
+    text = normalize_text(update.message.text)
+    if text == "menu":
+        keyboard = ReplyKeyboardMarkup([[TELEGRAM_MENU_BUTTON_STATS]], resize_keyboard=True)
+        await update.message.reply_text("Paper menu", reply_markup=keyboard)
+        return
+    if text in (normalize_text(TELEGRAM_MENU_BUTTON_STATS), "stats", "статистика"):
+        await telegram_stats(update, context)
+
+def run_telegram_bot():
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    loop = None
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+        app.add_handler(CommandHandler("menu", telegram_menu))
+        app.add_handler(CommandHandler("stats", telegram_stats))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, telegram_text))
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, close_loop=False, stop_signals=None)
+    except Exception as error:
+        log(f"Telegram bot stopped: {error}", level="WARNING")
+    finally:
+        asyncio.set_event_loop(None)
+        if loop is not None and not loop.is_closed():
+            loop.close()
+
+def start_telegram_bot_thread():
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    thread = threading.Thread(target=run_telegram_bot, name="paper-telegram", daemon=True)
+    thread.start()
 
 # --- ВИРТУАЛЬНЫЙ КЛИЕНТ POLYMARKET (СЕРДЦЕ PAPER TRADING) ---
 class PaperPolymarketClient:
@@ -260,7 +411,12 @@ class PaperPolymarketClient:
 
         self.save_wallet()
         log(f"💰 [VIRTUAL SOLD] {shares:.2f} shares @ ${actual_price:.4f} (+${proceeds:.2f})")
-        return {"orderID": "virtual_sell_" + str(int(time.time()))}
+        return {
+            "orderID": "virtual_sell_" + str(int(time.time())),
+            "price": actual_price,
+            "shares": shares,
+            "proceeds": proceeds,
+        }
 
     def place_limit_sell(self, *args, **kwargs): return {"orderID": "mock_limit_123"}
     def cancel_order_by_id(self, order_id): return True
@@ -277,7 +433,7 @@ def maintain_price_history(valid_events):
     for event in valid_events:
         for market in event.get("markets", []):
             if market.get("closed"): continue
-            outcomes = market.get("outcomes", [])
+            outcomes = parse_outcomes(market)
             prices = parse_outcome_prices(market)
             token_ids = parse_token_ids(market)
             if len(prices) != len(token_ids): continue
@@ -340,6 +496,8 @@ def journal_entry(state, action, payload): pass
 def queue_pending_exit(state, position, reason, journal_action, sell_price, sync_snapshot=None):
     state.setdefault("pending_exits", {})[str(position["asset_id"])] = position
     state["pending_exits"][str(position["asset_id"])]["reason"] = reason
+    state["pending_exits"][str(position["asset_id"])]["journal_action"] = journal_action
+    state["pending_exits"][str(position["asset_id"])]["exit_signal_price"] = sell_price
 
 # --- ВХОД (С ЗАЩИТОЙ) ---
 def attempt_entries(execution_client, state, sync_snapshot):
@@ -401,13 +559,20 @@ def attempt_pending_exits(execution_client, state):
         min_sell = max(round_price_to_tick(sell_price * 0.95, pending.get("tick_size", "0.01")), 0.02)
         
         try:
-            execution_client.place_market_sell(asset_id, shares, pending.get("tick_size", "0.01"), min_price_slippage=min_sell)
+            sell_result = execution_client.place_market_sell(asset_id, shares, pending.get("tick_size", "0.01"), min_price_slippage=min_sell)
+            actual_sell_price = safe_float(sell_result.get("price"), exec_price)
+            proceeds = safe_float(sell_result.get("proceeds"), shares * actual_sell_price)
+            cost = shares * safe_float(pending.get("avg_price"))
+            profit = proceeds - cost
+            exit_type = classify_exit(pending.get("reason"), profit)
             
             # Удаляем позицию из активных и пендингов
             state["active_positions"] = [p for p in state["active_positions"] if str(p["asset_id"]) != asset_id]
             del exits[asset_id]
+            record_closed_trade(state, exit_type, profit)
+            sync_exchange(execution_client, state)
             save_json(LIVE_STATE_FILE, state)
-            log(f"✅ Успешный виртуальный экзит по причине: {pending['reason']}", tg=True)
+            log(build_exit_message(pending, pending["reason"], shares, actual_sell_price, proceeds, profit, state), tg=True)
             
         except Exception as e:
             log(f"Virtual SELL failed: {e}", level="WARNING")
@@ -440,16 +605,20 @@ def sync_exchange(client, state):
 
 def main():
     log("=== VIRTUAL PAPER TRADING STARTED ===", tg=True)
-    state = load_json(LIVE_STATE_FILE, default_live_state())
+    state = ensure_live_state_schema(load_json(LIVE_STATE_FILE, default_live_state()))
     execution_client = PaperPolymarketClient()
     execution_client.initialize()
+    start_telegram_bot_thread()
 
     while True:
         try:
             sync_exchange(execution_client, state)
+            set_telegram_snapshot(state)
             attempt_pending_exits(execution_client, state)
             attempt_exits(execution_client, state)
             attempt_entries(execution_client, state, state)
+            sync_exchange(execution_client, state)
+            set_telegram_snapshot(state)
             save_json(LIVE_STATE_FILE, state)
             
             log(f"Cycle completed. Virtual Balance: ${execution_client.wallet['usdc']:.2f} | Open Positions: {len(state['active_positions'])}")
